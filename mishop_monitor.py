@@ -19,7 +19,7 @@ from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -439,6 +439,9 @@ def _post(url, payload):
 
 def confirmar_comando(cid): return _post(CFG["confirmar_url"], {"p_device_token": CFG["device_token"], "p_comando_id": cid, "p_estado": estado})
 def reportar_estado(): return _post(CFG["reportar_url"], {"p_device_token": CFG["device_token"], "p_estado": estado})
+def _reportar_estado_seguro():
+    try: reportar_estado()
+    except Exception: pass
 def enviar_muestras(m): return _post(CFG["ingest_url"], {"p_device_token": CFG["device_token"], "p_samples": m})
 def enviar_captura(ts, b): return _post(CFG["screenshot_url"], {"p_device_token": CFG["device_token"], "p_captured_at": ts, "p_image_b64": base64.b64encode(b).decode("ascii")})
 def pausa_iniciar(tipo, motivo): _post(CFG["pausa_iniciar_url"], {"p_device_token": CFG["device_token"], "p_tipo": tipo, "p_motivo": motivo or ""})
@@ -662,6 +665,12 @@ def set_estado(nuevo, motivo=""):
             icono.icon = imagen_icono(); icono.title = titulo_estado(); icono.update_menu()
         except Exception as e:
             log("actualizar icono fallo: %r" % (e,))
+    # Avisar al CRM al instante (no esperar al próximo chequeo de ~25s), en
+    # segundo plano para no trabar el iconito.
+    try:
+        threading.Thread(target=_reportar_estado_seguro, daemon=True).start()
+    except Exception:
+        pass
 
 
 def pedir_motivo_libre():

@@ -63,3 +63,18 @@ Filename: "taskkill"; Parameters: "/F /IM ""{#MyAppExeName}"""; Flags: runhidden
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{userappdata}\MishopMonitor"
+
+[Code]
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
+begin
+  { Cerrar el monitor ANTES de borrar archivos: así deja de reportar al
+    instante y la carpeta del programa se puede eliminar limpia (si el proceso
+    sigue vivo, Windows no deja borrar su .exe y queda a medias). }
+  if CurUninstallStep = usUninstall then
+  begin
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "{#MyAppExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(800);
+  end;
+end;
