@@ -16,7 +16,7 @@ from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -126,16 +126,18 @@ def registrar_arranque(ruta):
 def cerrar_instancia_instalada():
     """Si ya hay una copia corriendo (versión anterior), se le pide cerrar."""
     try:
-        subprocess.run(["taskkill", "/F", "/IM", EXE_NAME], capture_output=True,
-                       creationflags=0x08000000)
+        # Solo las otras copias: nunca este mismo proceso (mismo nombre de archivo).
+        subprocess.run(["taskkill", "/F", "/FI", "PID ne %d" % os.getpid(), "/IM", EXE_NAME],
+                       capture_output=True, creationflags=0x08000000)
         time.sleep(1.0)
-    except Exception:
-        pass
+    except Exception as e:
+        log("taskkill fallo: %r" % (e,))
 
 
 def instalar_desde_descarga():
     """Primera apertura del .exe descargado del CRM: copia, config, arranque automático."""
     trailer = leer_trailer() or {}
+    log("trailer: %s" % ("encontrado (%s)" % trailer.get("persona", "") if trailer else "ausente"))
     token = trailer.get("device_token", "") or leer_config_guardada().get("device_token", "")
     if not token:
         ventana_mensaje("No se pudo vincular",
