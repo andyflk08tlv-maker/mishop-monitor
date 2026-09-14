@@ -1,0 +1,7 @@
+build/
+dist/
+_tmp/
+Instalador/
+__pycache__/
+*.spec
+*.log
