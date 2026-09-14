@@ -19,7 +19,7 @@ from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -27,6 +27,8 @@ CONFIG_BASE = {
     "device_token": "",
     "sample_interval_seconds": 15, "flush_interval_seconds": 60,
     "idle_threshold_seconds": 300, "screenshot_interval_minutes": 5,
+    "auto_end_idle_minutes": 60,  # cierra el turno solo si no hay actividad por este tiempo
+    "resume_window_minutes": 30,  # si reinició estando Activo hace poco, reanuda sin preguntar
 }
 
 TRAILER_INICIO = b"MISHOPCFG1"
@@ -455,13 +457,21 @@ def leer_settings():
 
 
 def bucle_monitoreo():
+    global _auto_terminado
     pendientes = []; ultimo_flush = time.time(); ultima_captura = 0; ultimo_settings = 0
     shot_enabled = True; shot_interval = CFG["screenshot_interval_minutes"] * 60
+    auto_end = max(5, int(CFG.get("auto_end_idle_minutes", 60))) * 60
     host = socket.gethostname()
     while True:
         with _lock:
             activo = (estado == Estado.ACTIVO)
+            apagado = (estado == Estado.APAGADO)
         if not activo:
+            # Si el turno se cerró solo por inactividad y la persona volvió a la PC,
+            # se le vuelve a ofrecer empezar (un clic), sin contar el tiempo que estuvo fuera.
+            if apagado and _auto_terminado and segundos_inactivo() < 60:
+                _auto_terminado = False
+                mostrar_prompt_empezar()
             pendientes = []; time.sleep(2); continue
         if time.time() - ultimo_settings >= 300:
             s = leer_settings()
@@ -469,7 +479,20 @@ def bucle_monitoreo():
                 shot_enabled = bool(s.get("screenshots_enabled", True))
                 shot_interval = max(1, int(s.get("screenshot_interval_minutes", 5))) * 60
             ultimo_settings = time.time()
-        app_name, titulo = ventana_activa(); idle = segundos_inactivo()
+        idle = segundos_inactivo()
+        # Cerrar el turno solo si lleva mucho rato sin actividad (no contar la noche
+        # ni cuando dejan la PC prendida). Al volver, se ofrece empezar de nuevo.
+        if idle >= auto_end:
+            log("fin de turno por inactividad (%d min)" % (auto_end // 60))
+            try:
+                pausa_iniciar("fin_turno", "inactividad")
+            except Exception:
+                pass
+            set_estado(Estado.APAGADO)
+            _auto_terminado = True
+            pendientes = []
+            continue
+        app_name, titulo = ventana_activa()
         pendientes.append({"captured_at": datetime.now(timezone.utc).isoformat(),
             "active_app": app_name, "window_title": titulo, "idle_seconds": round(idle, 1),
             "is_idle": idle >= CFG["idle_threshold_seconds"], "hostname": host, "os": "windows"})
@@ -488,6 +511,74 @@ def bucle_monitoreo():
 # ------------------------------------------------------------- bandeja
 COLORES = {Estado.ACTIVO: (18, 161, 80), Estado.PAUSA: (224, 160, 32), Estado.APAGADO: (150, 150, 140)}
 icono = None
+_auto_terminado = False   # el último fin de turno fue por inactividad (para volver a ofrecer empezar)
+_prompt_abierto = False   # hay una ventana "Empezar mi turno" abierta ahora
+
+
+def ventana_empezar_turno(persona=""):
+    """Avisito diario: un botón grande para empezar el turno. Si no le dan, no cuenta nada."""
+    global _prompt_abierto
+    if _prompt_abierto:
+        return
+    _prompt_abierto = True
+    try:
+        import tkinter as tk
+        from tkinter import font as tkfont
+    except Exception:
+        _prompt_abierto = False
+        return
+    VERDE = "#0E9A5A"; VERDE_OSC = "#0A7C46"
+    root = tk.Tk()
+    root.title(APP_NAME)
+    root.configure(bg="#ffffff")
+    root.resizable(False, False)
+    ancho, alto = 400, 340
+    sx, sy = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry("%dx%d+%d+%d" % (ancho, alto, (sx - ancho) // 2, (sy - alto) // 3))
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    ic = tk.Canvas(root, width=64, height=64, bg="#ffffff", highlightthickness=0)
+    ic.pack(pady=(30, 12))
+    _dibujar_icono(ic, 4, 4, 56, color="#15b36a")
+
+    tkfont.Font(family="Segoe UI", size=15, weight="bold")
+    tk.Label(root, text="¿Empezamos tu turno?", font=tkfont.Font(family="Segoe UI", size=16, weight="bold"),
+             bg="#ffffff", fg="#141b22").pack()
+    quien = (persona or "").strip()
+    tk.Label(root, text=("Hola %s" % quien) if quien else "Marca el inicio de tu jornada",
+             font=tkfont.Font(family="Segoe UI", size=10), bg="#ffffff", fg="#7a828b").pack(pady=(4, 18))
+
+    def _empezar(_=None):
+        try:
+            pausa_terminar()
+        except Exception:
+            pass
+        set_estado(Estado.ACTIVO)
+        root.destroy()
+
+    tk.Button(root, text="Empezar mi turno", font=tkfont.Font(family="Segoe UI", size=13, weight="bold"),
+              bg=VERDE, fg="#ffffff", activebackground=VERDE_OSC, activeforeground="#ffffff",
+              relief="flat", cursor="hand2", command=_empezar).pack(fill="x", padx=40, ipady=8)
+    tk.Label(root, text="Si prendiste la PC para otra cosa, cierra esta ventana:\nno se cuenta nada hasta que empieces.",
+             font=tkfont.Font(family="Segoe UI", size=8), bg="#ffffff", fg="#9aa0a6", justify="center").pack(pady=(10, 0))
+    tk.Button(root, text="Ahora no", font=tkfont.Font(family="Segoe UI", size=9), bg="#ffffff", fg="#7a828b",
+              activebackground="#ffffff", relief="flat", cursor="hand2", command=root.destroy).pack(pady=(6, 0))
+
+    try:
+        root.mainloop()
+    finally:
+        _prompt_abierto = False
+
+
+def mostrar_prompt_empezar():
+    """Abre el avisito de empezar turno en su propio hilo (sin bloquear el monitoreo)."""
+    if _prompt_abierto:
+        return
+    quien = (leer_config_guardada().get("persona") or "").strip()
+    threading.Thread(target=ventana_empezar_turno, args=(quien,), daemon=True).start()
 
 
 def imagen_icono():
@@ -521,6 +612,14 @@ def set_estado(nuevo, motivo=""):
     with _lock:
         estado = nuevo; motivo_pausa = motivo
     log("estado -> %s %s" % (nuevo, motivo))
+    # Recordar el estado para poder reanudar tras un reinicio.
+    try:
+        guardar_config({"ultimo_estado": nuevo, "ultimo_estado_at": datetime.now(timezone.utc).isoformat()})
+    except Exception:
+        pass
+    if nuevo == Estado.ACTIVO:
+        global _auto_terminado
+        _auto_terminado = False
     if icono is not None:
         try:
             icono.icon = imagen_icono(); icono.title = titulo_estado(); icono.update_menu()
@@ -622,6 +721,28 @@ def main():
                         "Descárgalo otra vez desde tu CRM (\"Mi rendimiento\" →\n"
                         "\"Instalar Mishop Monitor en esta PC\") y ábrelo.")
         return
+
+    # Arranque diario (no venimos del instalador): reanudar si estaba Activo hace poco
+    # (reinicio en pleno trabajo) o, si no, ofrecer "Empezar mi turno" con un clic.
+    if mostrar_listo is None:
+        global estado
+        cfg = leer_config_guardada()
+        reanudar = False
+        if cfg.get("ultimo_estado") == Estado.ACTIVO and cfg.get("ultimo_estado_at"):
+            try:
+                dt = datetime.fromisoformat(cfg["ultimo_estado_at"])
+                ventana = CFG.get("resume_window_minutes", 30) * 60
+                if (datetime.now(timezone.utc) - dt).total_seconds() < ventana:
+                    reanudar = True
+            except Exception:
+                pass
+        if reanudar:
+            estado = Estado.ACTIVO
+            log("reanudando turno activo tras reinicio")
+        else:
+            threading.Thread(target=ventana_empezar_turno,
+                             args=((cfg.get("persona") or "").strip(),), daemon=True).start()
+
     correr_bandeja()
 
 
