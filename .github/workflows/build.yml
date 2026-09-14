@@ -7,6 +7,7 @@ name: Armar Mishop Monitor (Windows)
 # Pasos: PyInstaller en modo --onedir (carpeta con la app, no un .exe
 # autoextraíble: dispara muchas menos alarmas de antivirus) → Inno Setup arma
 # el instalador estándar (se instala por usuario, sin admin, con desinstalador).
+# También publica version.json (versión + link) para la auto-actualización.
 
 on:
   push:
@@ -61,6 +62,17 @@ jobs:
           if (!(Test-Path "dist\MishopMonitorSetup.exe")) { throw "No se generó el instalador" }
           Get-Item dist\MishopMonitorSetup.exe | Select-Object Name, Length
 
+      - name: Escribir version.json (para auto-actualización)
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $obj = [ordered]@{
+            version = $v
+            url = "https://github.com/andyflk08tlv-maker/mishop-monitor/releases/download/latest/MishopMonitorSetup.exe"
+          }
+          ($obj | ConvertTo-Json -Compress) | Set-Content -Path dist\version.json -Encoding ascii
+          Get-Content dist\version.json
+
       - name: Publicar en el release "latest"
         uses: softprops/action-gh-release@v2
         with:
@@ -68,4 +80,6 @@ jobs:
           name: Mishop Monitor (última versión)
           body: "Instalador de Windows armado automáticamente. Descárgalo desde tu CRM para que venga vinculado a tu cuenta."
           prerelease: false
-          files: dist/MishopMonitorSetup.exe
+          files: |
+            dist/MishopMonitorSetup.exe
+            dist/version.json
