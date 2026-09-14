@@ -19,7 +19,7 @@ from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -225,48 +225,127 @@ def ventana_mensaje(titulo, texto):
         pass
 
 
+def _rrect(cv, x1, y1, x2, y2, r, **kw):
+    """Rectángulo redondeado en un Canvas de tkinter."""
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
+def _dibujar_pulso(cv, x, y, s, color, width):
+    p = [(0.15, 0.52), (0.35, 0.52), (0.47, 0.32), (0.60, 0.76), (0.70, 0.48), (0.85, 0.48)]
+    flat = []
+    for px, py in p:
+        flat += [x + px * s, y + py * s]
+    cv.create_line(*flat, fill=color, width=width, capstyle="round", joinstyle="round")
+
+
+def _dibujar_icono(cv, x, y, s, color="#15b36a"):
+    """Dibuja el icono de la app (cuadrito redondeado + pulso) en un Canvas."""
+    _rrect(cv, x, y, x + s, y + s, s * 0.24, fill=color, outline="")
+    _dibujar_pulso(cv, x, y, s, "#ffffff", max(2, int(s * 0.09)))
+
+
 def ventana_listo(persona, empresa):
-    """Pantalla final del instalador: 'Listo' con flecha al iconito."""
+    """Pantalla final del instalador: confirmación + iniciar turno + dónde está el iconito."""
     try:
         import tkinter as tk
         from tkinter import font as tkfont
     except Exception:
-        ventana_mensaje("Listo", "Mishop Monitor quedó instalado.\nBusca el iconito en la bandeja (abajo a la derecha) y elige \"Iniciar turno\".")
+        ventana_mensaje("Listo", "Mishop Monitor quedó instalado.\nBusca el iconito verde en la bandeja (abajo a la derecha) y elige \"Iniciar turno\".")
         return
+
+    VERDE = "#0E9A5A"; VERDE_OSC = "#0A7C46"; TXT = "#141b22"; GRIS = "#7a828b"
     root = tk.Tk()
     root.title(APP_NAME)
     root.configure(bg="#ffffff")
     root.resizable(False, False)
-    ancho, alto = 460, 330
+    ancho, alto = 468, 560
     sx, sy = root.winfo_screenwidth(), root.winfo_screenheight()
-    root.geometry("%dx%d+%d+%d" % (ancho, alto, (sx - ancho) // 2, (sy - alto) // 2))
+    root.geometry("%dx%d+%d+%d" % (ancho, alto, (sx - ancho) // 2, (sy - alto) // 3))
     try:
         root.attributes("-topmost", True)
     except Exception:
         pass
 
-    lienzo = tk.Canvas(root, width=72, height=72, bg="#ffffff", highlightthickness=0)
-    lienzo.pack(pady=(28, 8))
-    lienzo.create_oval(4, 4, 68, 68, fill="#12a150", outline="")
-    lienzo.create_line(22, 38, 32, 48, 52, 26, fill="#ffffff", width=6, capstyle="round", joinstyle="round")
+    f_tit = tkfont.Font(family="Segoe UI", size=17, weight="bold")
+    f_txt = tkfont.Font(family="Segoe UI", size=10)
+    f_sub = tkfont.Font(family="Segoe UI", size=10)
+    f_bold = tkfont.Font(family="Segoe UI", size=10, weight="bold")
+    f_btn = tkfont.Font(family="Segoe UI", size=13, weight="bold")
+    f_min = tkfont.Font(family="Segoe UI", size=9)
 
-    f_titulo = tkfont.Font(family="Segoe UI", size=16, weight="bold")
-    f_texto = tkfont.Font(family="Segoe UI", size=10)
-    tk.Label(root, text="¡Listo! Mishop Monitor quedó instalado", font=f_titulo, bg="#ffffff", fg="#111827").pack()
+    # Check verde
+    ck = tk.Canvas(root, width=76, height=76, bg="#ffffff", highlightthickness=0)
+    ck.pack(pady=(30, 10))
+    ck.create_oval(6, 6, 70, 70, fill=VERDE, outline="")
+    ck.create_line(24, 40, 34, 50, 53, 28, fill="#ffffff", width=7, capstyle="round", joinstyle="round")
+
+    tk.Label(root, text="¡Listo! Ya quedaste instalado", font=f_tit, bg="#ffffff", fg=TXT).pack()
+
     quien = (persona or "").strip()
     donde = (empresa or "").strip()
-    sub = "Vinculado a %s" % quien if quien else "Vinculado a tu cuenta"
+    fila_sub = tk.Frame(root, bg="#ffffff"); fila_sub.pack(pady=(5, 18))
+    tk.Label(fila_sub, text="Vinculado a ", font=f_sub, bg="#ffffff", fg=GRIS).pack(side="left")
+    tk.Label(fila_sub, text=(quien or "tu cuenta"), font=f_bold, bg="#ffffff", fg=VERDE_OSC).pack(side="left")
     if donde:
-        sub += " · " + donde
-    tk.Label(root, text=sub, font=f_texto, bg="#ffffff", fg="#6b7280").pack(pady=(4, 14))
-    tk.Label(root, text="Busca el iconito gris en la bandeja del sistema (abajo a la derecha,\n"
-                        "junto al reloj; si no lo ves, toca la flechita ^).\n"
-                        "Haz clic derecho en él y elige \"Iniciar turno\" para empezar.\n\n"
-                        "Se abrirá solo cada vez que prendas la computadora.",
-             font=f_texto, bg="#ffffff", fg="#374151", justify="center").pack()
-    tk.Button(root, text="Entendido", command=root.destroy, font=f_texto, bg="#12a150", fg="#ffffff",
-              activebackground="#0e8a44", activeforeground="#ffffff", relief="flat", padx=22, pady=6,
-              cursor="hand2").pack(pady=(18, 0))
+        tk.Label(fila_sub, text="  ·  " + donde, font=f_sub, bg="#ffffff", fg=GRIS).pack(side="left")
+
+    estado_lbl = {"nota": None, "btn": None}
+
+    def _iniciar(_=None):
+        try:
+            pausa_terminar()
+        except Exception:
+            pass
+        try:
+            set_estado(Estado.ACTIVO)
+        except Exception:
+            pass
+        b = estado_lbl["btn"]
+        if b is not None:
+            b.config(text="✓  Tu turno está activo", bg="#e7f5ee", fg=VERDE_OSC,
+                     activebackground="#e7f5ee", state="disabled", disabledforeground=VERDE_OSC, cursor="")
+        if estado_lbl["nota"] is not None:
+            estado_lbl["nota"].config(text="Ya estás trabajando. Puedes cerrar esta ventana.")
+
+    btn = tk.Button(root, text="Iniciar mi turno ahora", font=f_btn, bg=VERDE, fg="#ffffff",
+                    activebackground=VERDE_OSC, activeforeground="#ffffff", relief="flat",
+                    cursor="hand2", command=_iniciar)
+    btn.pack(fill="x", padx=40, ipady=9)
+    estado_lbl["btn"] = btn
+
+    nota = tk.Label(root, text="Se abrirá solo cada vez que prendas la computadora.",
+                    font=f_min, bg="#ffffff", fg="#9aa0a6")
+    nota.pack(pady=(11, 0))
+    estado_lbl["nota"] = nota
+
+    tk.Frame(root, bg="#eef1f4", height=1).pack(fill="x", padx=40, pady=(22, 18))
+
+    # Info: dónde está el iconito
+    fila = tk.Frame(root, bg="#ffffff"); fila.pack(fill="x", padx=40)
+    ic = tk.Canvas(fila, width=40, height=40, bg="#ffffff", highlightthickness=0)
+    ic.pack(side="left", anchor="n")
+    _dibujar_icono(ic, 2, 2, 36)
+    tk.Label(fila, text="Para pausar o terminar tu turno más tarde, haz clic en el\n"
+                        "iconito verde de la esquina, junto al reloj:",
+             font=f_txt, bg="#ffffff", fg="#5b6570", justify="left").pack(side="left", padx=(12, 0))
+
+    # Ilustración de la bandeja de Windows
+    tb = tk.Canvas(root, width=388, height=72, bg="#ffffff", highlightthickness=0)
+    tb.pack(pady=(16, 0))
+    _rrect(tb, 40, 16, 348, 60, 12, fill="#f3f5f7", outline="#e3e7ea")
+    tb.create_text(66, 38, text="⌃", font=tkfont.Font(family="Segoe UI", size=13, weight="bold"), fill="#8a929b")
+    _rrect(tb, 92, 30, 108, 46, 4, fill="#c2c8ce", outline="")
+    _rrect(tb, 120, 30, 136, 46, 4, fill="#c2c8ce", outline="")
+    # icono verde resaltado
+    tb.create_oval(150, 22, 186, 58, outline="#17C776", width=3)
+    _dibujar_icono(tb, 156, 28, 24)
+    tb.create_text(232, 32, text="3:45 p.m.", font=f_min, fill="#4b5560")
+    tb.create_text(232, 47, text="14/09/2026", font=tkfont.Font(family="Segoe UI", size=8), fill="#8a929b")
+    # flechita que apunta al icono
+    tb.create_line(168, 14, 168, 20, fill="#17C776", width=2)
+
     root.mainloop()
 
 
@@ -413,14 +492,22 @@ icono = None
 
 
 def imagen_icono():
+    """Icono de la bandeja: cuadrito redondeado del color del estado + pulso blanco.
+    Se dibuja en grande y se reduce para que quede con bordes suaves."""
     from PIL import Image, ImageDraw
     with _lock:
-        color = COLORES[estado]; apag = (estado == Estado.APAGADO)
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0)); d = ImageDraw.Draw(img)
-    if apag: d.rounded_rectangle([8, 8, 56, 56], radius=14, outline=color, width=5)
-    else: d.rounded_rectangle([8, 8, 56, 56], radius=14, fill=color)
-    d.line([(16, 34), (25, 34), (30, 46), (38, 20), (43, 34), (50, 34)], fill=color if apag else (255, 255, 255), width=5, joint="curve")
-    return img
+        color = COLORES[estado]
+    S = 256
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([20, 20, S - 20, S - 20], radius=60, fill=color)
+    p = [(0.15, 0.52), (0.35, 0.52), (0.47, 0.32), (0.60, 0.76), (0.70, 0.48), (0.85, 0.48)]
+    pts = [(20 + px * (S - 40), 20 + py * (S - 40)) for px, py in p]
+    d.line(pts, fill=(255, 255, 255, 255), width=16, joint="curve")
+    rcap = 8
+    for cx, cy in (pts[0], pts[-1]):
+        d.ellipse([cx - rcap, cy - rcap, cx + rcap, cy + rcap], fill=(255, 255, 255, 255))
+    return img.resize((64, 64), Image.LANCZOS)
 
 
 def titulo_estado():
@@ -435,7 +522,11 @@ def set_estado(nuevo, motivo=""):
     with _lock:
         estado = nuevo; motivo_pausa = motivo
     log("estado -> %s %s" % (nuevo, motivo))
-    icono.icon = imagen_icono(); icono.title = titulo_estado(); icono.update_menu()
+    if icono is not None:
+        try:
+            icono.icon = imagen_icono(); icono.title = titulo_estado(); icono.update_menu()
+        except Exception as e:
+            log("actualizar icono fallo: %r" % (e,))
 
 
 def pedir_motivo_libre():
