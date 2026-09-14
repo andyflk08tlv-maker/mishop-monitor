@@ -1,8 +1,12 @@
 name: Armar Mishop Monitor (Windows)
 
-# Cada cambio en main arma el .exe en una máquina Windows de GitHub y lo deja
-# en el "release" fijo llamado `latest`. El CRM descarga siempre de ahí:
-# https://github.com/<cuenta>/mishop-monitor/releases/latest/download/MishopMonitor.exe
+# Cada cambio en main arma el instalador en una máquina Windows de GitHub y lo
+# deja en el "release" fijo llamado `latest`. El CRM descarga siempre de ahí:
+#   https://github.com/<cuenta>/mishop-monitor/releases/latest/download/MishopMonitorSetup.exe
+#
+# Pasos: PyInstaller en modo --onedir (carpeta con la app, no un .exe
+# autoextraíble: dispara muchas menos alarmas de antivirus) → Inno Setup arma
+# el instalador estándar (se instala por usuario, sin admin, con desinstalador).
 
 on:
   push:
@@ -27,18 +31,35 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pystray pillow pyinstaller
 
-      - name: Construir el .exe
+      - name: Construir la app (carpeta)
         run: >
-          python -m PyInstaller --onefile --noconsole --name "MishopMonitor"
+          python -m PyInstaller --onedir --noconsole --name "Mishop Monitor"
+          --icon icono.ico
           --hidden-import pystray._win32
-          --distpath dist --workpath build --specpath build
+          --distpath dist\MishopMonitor-build --workpath build --specpath build
           mishop_monitor.py
 
-      - name: Verificar
+      - name: Ordenar carpeta para el instalador
         shell: pwsh
         run: |
-          if (!(Test-Path "dist/MishopMonitor.exe")) { throw "No se generó el .exe" }
-          Get-Item dist/MishopMonitor.exe | Select-Object Name, Length
+          New-Item -ItemType Directory -Force -Path dist\MishopMonitor | Out-Null
+          Copy-Item -Recurse -Force "dist\MishopMonitor-build\Mishop Monitor\*" dist\MishopMonitor\
+          if (!(Test-Path "dist\MishopMonitor\Mishop Monitor.exe")) { throw "No se generó la app" }
+
+      - name: Versión (desde mishop_monitor.py)
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path mishop_monitor.py -Pattern 'VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "Versión $v"
+
+      - name: Armar el instalador (Inno Setup)
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=${{ steps.ver.outputs.version }} instalador.iss
+          if (!(Test-Path "dist\MishopMonitorSetup.exe")) { throw "No se generó el instalador" }
+          Get-Item dist\MishopMonitorSetup.exe | Select-Object Name, Length
 
       - name: Publicar en el release "latest"
         uses: softprops/action-gh-release@v2
@@ -47,4 +68,4 @@ jobs:
           name: Mishop Monitor (última versión)
           body: "Instalador de Windows armado automáticamente. Descárgalo desde tu CRM para que venga vinculado a tu cuenta."
           prerelease: false
-          files: dist/MishopMonitor.exe
+          files: dist/MishopMonitorSetup.exe
