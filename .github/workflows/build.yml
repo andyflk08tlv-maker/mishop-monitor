@@ -36,7 +36,7 @@ jobs:
           python -m PyInstaller --onedir --noconsole --name "Mishop Monitor"
           --icon icono.ico
           --hidden-import pystray._win32
-          --distpath dist\MishopMonitor-build --workpath build --specpath build
+          --distpath dist\MishopMonitor-build --workpath build
           mishop_monitor.py
 
       - name: Ordenar carpeta para el instalador
