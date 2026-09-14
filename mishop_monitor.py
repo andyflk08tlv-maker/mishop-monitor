@@ -327,8 +327,7 @@ def ventana_listo(persona, empresa):
     ic = tk.Canvas(fila, width=40, height=40, bg="#ffffff", highlightthickness=0)
     ic.pack(side="left", anchor="n")
     _dibujar_icono(ic, 2, 2, 36)
-    tk.Label(fila, text="Para pausar o terminar tu turno más tarde, haz clic en el\n"
-                        "iconito verde de la esquina, junto al reloj:",
+    tk.Label(fila, text="Para pausar o terminar tu turno,\nusa el iconito verde junto al reloj:",
              font=f_txt, bg="#ffffff", fg="#5b6570", justify="left").pack(side="left", padx=(12, 0))
 
     # Ilustración de la bandeja de Windows
