@@ -12,14 +12,14 @@ Activo (verde) / En pausa (ámbar) / Turno terminado (gris).
 (Se conserva el modo antiguo: si el .exe se abre desde fuera de su carpeta de
 instalación y trae el bloque pegado, se instala solo en %LOCALAPPDATA%.)
 """
-import os, io, sys, json, time, base64, socket, shutil, threading, ctypes, subprocess
+import os, io, sys, json, time, base64, socket, shutil, tempfile, threading, ctypes, subprocess
 from ctypes import wintypes
 from datetime import datetime, timezone
 from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -29,6 +29,10 @@ CONFIG_BASE = {
     "idle_threshold_seconds": 300, "screenshot_interval_minutes": 5,
     "auto_end_idle_minutes": 60,  # cierra el turno solo si no hay actividad por este tiempo
     "resume_window_minutes": 30,  # si reinició estando Activo hace poco, reanuda sin preguntar
+    # Auto-actualización: la app se mantiene al día sola (el trabajador no hace nada).
+    "version_url": "https://github.com/andyflk08tlv-maker/mishop-monitor/releases/download/latest/version.json",
+    "setup_url": "https://github.com/andyflk08tlv-maker/mishop-monitor/releases/download/latest/MishopMonitorSetup.exe",
+    "update_check_hours": 6,
 }
 
 TRAILER_INICIO = b"MISHOPCFG1"
@@ -359,6 +363,83 @@ def instancia_unica():
         return kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
     except Exception:
         return True
+
+
+# ------------------------------------------------------- auto-actualización
+def _ver_tupla(v):
+    try:
+        return tuple(int(x) for x in str(v).strip().split("."))
+    except Exception:
+        return ()
+
+
+def _hay_version_nueva(remota, local):
+    r, l = _ver_tupla(remota), _ver_tupla(local)
+    return bool(r) and r > l
+
+
+def _descargar(url, destino):
+    req = urlrequest.Request(url, headers={"User-Agent": "MishopMonitor/%s" % VERSION})
+    with urlrequest.urlopen(req, timeout=90) as resp, open(destino, "wb") as f:
+        shutil.copyfileobj(resp, f)
+
+
+def buscar_e_instalar_actualizacion():
+    """Si hay una versión más nueva publicada, la instala sola en segundo plano
+    y reabre la app. El trabajador no hace nada y nunca queda atrasado.
+
+    Segura: el token vive en config.json (no se toca al actualizar), y salimos
+    del proceso ANTES de instalar para que no haya archivos bloqueados; un .bat
+    desatendido corre el instalador silencioso y vuelve a abrir la app."""
+    if not es_exe_congelado() or not corre_desde_instalacion():
+        return  # en desarrollo o .exe suelto: no auto-actualizar
+    try:
+        req = urlrequest.Request(CFG.get("version_url", ""),
+                                 headers={"User-Agent": "MishopMonitor/%s" % VERSION})
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            info = json.loads(resp.read().decode("utf-8"))
+        remota = info.get("version", "")
+        if not _hay_version_nueva(remota, VERSION):
+            return
+        url_setup = info.get("url") or CFG.get("setup_url", "")
+        if not url_setup:
+            return
+        log("actualización disponible: %s (tengo %s)" % (remota, VERSION))
+        setup = os.path.join(tempfile.gettempdir(), "MishopMonitorSetup.exe")
+        _descargar(url_setup, setup)
+        if not (os.path.isfile(setup) and os.path.getsize(setup) > 500000):
+            log("setup descargado inválido; abandono actualización")
+            return
+        exe = ruta_exe()
+        bat = os.path.join(tempfile.gettempdir(), "mishop_update.bat")
+        with open(bat, "w", encoding="ascii", errors="ignore") as f:
+            f.write(
+                "@echo off\r\n"
+                "ping 127.0.0.1 -n 5 >nul\r\n"
+                '"%s" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART\r\n' % setup +
+                "ping 127.0.0.1 -n 3 >nul\r\n"
+                'start "" "%s"\r\n' % exe +
+                'del "%s"\r\n' % setup +
+                'del "%%~f0"\r\n'
+            )
+        DETACHED = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED|NEW_GROUP|NO_WINDOW
+        subprocess.Popen(["cmd", "/c", bat], creationflags=DETACHED, close_fds=True)
+        log("instalando actualización %s y reabriendo; salgo" % remota)
+        time.sleep(1.0)
+        os._exit(0)
+    except Exception as e:
+        log("auto-actualización falló: %r" % (e,))
+
+
+def bucle_actualizaciones():
+    time.sleep(45)  # dejar que arranque todo antes de la primera revisión
+    while True:
+        buscar_e_instalar_actualizacion()
+        try:
+            horas = max(1, int(CFG.get("update_check_hours", 6)))
+        except Exception:
+            horas = 6
+        time.sleep(horas * 3600)
 
 
 # ----------------------------------------------------------- monitoreo
@@ -788,6 +869,10 @@ def main():
         else:
             threading.Thread(target=ventana_empezar_turno,
                              args=((cfg.get("persona") or "").strip(),), daemon=True).start()
+
+    # Se mantiene al día sola: revisa si hay versión nueva y se actualiza en
+    # segundo plano, sin que el trabajador tenga que reinstalar nada.
+    threading.Thread(target=bucle_actualizaciones, daemon=True).start()
 
     correr_bandeja()
 
