@@ -19,7 +19,7 @@ from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -116,7 +116,8 @@ def armar_config():
     base = cfg["supabase_url"].rstrip("/") + "/rest/v1/rpc/"
     for k, fn in (("ingest_url", "ingest_activity"), ("settings_url", "get_monitor_settings"),
                   ("screenshot_url", "ingest_screenshot"), ("pausa_iniciar_url", "pausa_iniciar"),
-                  ("pausa_terminar_url", "pausa_terminar")):
+                  ("pausa_terminar_url", "pausa_terminar"),
+                  ("confirmar_url", "confirmar_comando"), ("reportar_url", "reportar_estado")):
         cfg[k] = base + fn
     return cfg
 
@@ -436,6 +437,8 @@ def _post(url, payload):
         return False
 
 
+def confirmar_comando(cid): return _post(CFG["confirmar_url"], {"p_device_token": CFG["device_token"], "p_comando_id": cid, "p_estado": estado})
+def reportar_estado(): return _post(CFG["reportar_url"], {"p_device_token": CFG["device_token"], "p_estado": estado})
 def enviar_muestras(m): return _post(CFG["ingest_url"], {"p_device_token": CFG["device_token"], "p_samples": m})
 def enviar_captura(ts, b): return _post(CFG["screenshot_url"], {"p_device_token": CFG["device_token"], "p_captured_at": ts, "p_image_b64": base64.b64encode(b).decode("ascii")})
 def pausa_iniciar(tipo, motivo): _post(CFG["pausa_iniciar_url"], {"p_device_token": CFG["device_token"], "p_tipo": tipo, "p_motivo": motivo or ""})
@@ -456,13 +459,52 @@ def leer_settings():
     return None
 
 
+def aplicar_comando(cmd, motivo=""):
+    """Aplica una orden que llegó desde el CRM."""
+    cmd = (cmd or "").strip().lower()
+    if cmd in ("iniciar", "reanudar", "empezar"):
+        try: pausa_terminar()
+        except Exception: pass
+        set_estado(Estado.ACTIVO)
+    elif cmd == "pausar":
+        try: pausa_iniciar("pausa", motivo)
+        except Exception: pass
+        set_estado(Estado.PAUSA, motivo or "Pausa")
+    elif cmd in ("terminar", "fin", "fin_turno"):
+        try: pausa_iniciar("fin_turno", "")
+        except Exception: pass
+        set_estado(Estado.APAGADO)
+    else:
+        return
+    log("comando del CRM aplicado: %s %s" % (cmd, motivo))
+
+
 def bucle_monitoreo():
-    global _auto_terminado
-    pendientes = []; ultimo_flush = time.time(); ultima_captura = 0; ultimo_settings = 0
+    global _auto_terminado, _ultimo_comando_id
+    pendientes = []; ultimo_flush = time.time(); ultima_captura = 0; ultimo_comando = 0
     shot_enabled = True; shot_interval = CFG["screenshot_interval_minutes"] * 60
     auto_end = max(5, int(CFG.get("auto_end_idle_minutes", 60))) * 60
     host = socket.gethostname()
     while True:
+        # --- Órdenes desde el CRM (funciona en cualquier estado; casi inmediato) ---
+        if time.time() - ultimo_comando >= 25:
+            ultimo_comando = time.time()
+            s = leer_settings()
+            if s:
+                shot_enabled = bool(s.get("screenshots_enabled", True))
+                shot_interval = max(1, int(s.get("screenshot_interval_minutes", 5))) * 60
+                try:
+                    cid = int(s.get("comando_id") or 0)
+                except Exception:
+                    cid = 0
+                cmd = s.get("comando")
+                if cmd and cid > _ultimo_comando_id:
+                    aplicar_comando(cmd, s.get("comando_motivo") or "")
+                    _ultimo_comando_id = cid
+                    try: confirmar_comando(cid)
+                    except Exception: pass
+            try: reportar_estado()
+            except Exception: pass
         with _lock:
             activo = (estado == Estado.ACTIVO)
             apagado = (estado == Estado.APAGADO)
@@ -473,12 +515,6 @@ def bucle_monitoreo():
                 _auto_terminado = False
                 mostrar_prompt_empezar()
             pendientes = []; time.sleep(2); continue
-        if time.time() - ultimo_settings >= 300:
-            s = leer_settings()
-            if s:
-                shot_enabled = bool(s.get("screenshots_enabled", True))
-                shot_interval = max(1, int(s.get("screenshot_interval_minutes", 5))) * 60
-            ultimo_settings = time.time()
         idle = segundos_inactivo()
         # Cerrar el turno solo si lleva mucho rato sin actividad (no contar la noche
         # ni cuando dejan la PC prendida). Al volver, se ofrece empezar de nuevo.
@@ -513,6 +549,7 @@ COLORES = {Estado.ACTIVO: (18, 161, 80), Estado.PAUSA: (224, 160, 32), Estado.AP
 icono = None
 _auto_terminado = False   # el último fin de turno fue por inactividad (para volver a ofrecer empezar)
 _prompt_abierto = False   # hay una ventana "Empezar mi turno" abierta ahora
+_ultimo_comando_id = 0    # último comando del CRM ya aplicado
 
 
 def ventana_empezar_turno(persona=""):
