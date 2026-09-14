@@ -2,12 +2,15 @@
 """
 Mishop Monitor — app de bandeja del sistema para Windows.
 
-Se descarga desde el CRM ya vinculada a la persona (el CRM le pega al final
-del .exe un bloque con su token). Al abrirla por primera vez se instala sola:
-se copia a %LOCALAPPDATA%\\MishopMonitor, guarda el token en
-%APPDATA%\\MishopMonitor\\config.json, se registra para arrancar con Windows
-y muestra una ventanita de "Listo". Desde ahí vive como iconito en la bandeja
-con tres estados: Activo (verde) / En pausa (ámbar) / Turno terminado (gris).
+Llega como instalador estándar (Inno Setup, ver instalador.iss) descargado
+desde el CRM ya vinculado a la persona: el CRM le pega al final del instalador
+un bloque MISHOPCFG1{...}MISHOPEND1 con su token. Al terminar de instalar, el
+instalador abre la app con `--instalador "<ruta>"`; la app lee el bloque de
+ese archivo, guarda %APPDATA%\\MishopMonitor\\config.json y muestra "Listo".
+Desde ahí vive como iconito en la bandeja con tres estados:
+Activo (verde) / En pausa (ámbar) / Turno terminado (gris).
+(Se conserva el modo antiguo: si el .exe se abre desde fuera de su carpeta de
+instalación y trae el bloque pegado, se instala solo en %LOCALAPPDATA%.)
 """
 import os, io, sys, json, time, base64, socket, shutil, threading, ctypes, subprocess
 from ctypes import wintypes
@@ -16,7 +19,7 @@ from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -36,6 +39,13 @@ INSTALL_DIR = os.path.join(LOCALAPPDATA, "MishopMonitor")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 LOG_PATH = os.path.join(DATA_DIR, "monitor.log")
 INSTALLED_EXE = os.path.join(INSTALL_DIR, EXE_NAME)
+INSTALL_DIR_INNO = os.path.join(LOCALAPPDATA, "Programs", APP_NAME)
+
+
+def corre_desde_instalacion():
+    """True si el .exe está en alguna de las carpetas de instalación."""
+    aqui = os.path.normcase(os.path.dirname(ruta_exe()))
+    return aqui in (os.path.normcase(INSTALL_DIR), os.path.normcase(INSTALL_DIR_INNO))
 
 
 # ----------------------------------------------------------------- utilidades
@@ -56,12 +66,13 @@ def es_exe_congelado():
     return bool(getattr(sys, "frozen", False))
 
 
-def leer_trailer():
-    """Bloque de configuración que el CRM pega al final del .exe descargado."""
-    if not es_exe_congelado():
+def leer_trailer(ruta=None):
+    """Bloque de configuración que el CRM pega al final del archivo descargado."""
+    ruta = ruta or ruta_exe()
+    if ruta == ruta_exe() and not es_exe_congelado():
         return None
     try:
-        with open(ruta_exe(), "rb") as f:
+        with open(ruta, "rb") as f:
             f.seek(0, os.SEEK_END)
             tam = f.tell()
             f.seek(max(0, tam - 8192))
@@ -132,6 +143,29 @@ def cerrar_instancia_instalada():
         time.sleep(1.0)
     except Exception as e:
         log("taskkill fallo: %r" % (e,))
+
+
+def vincular_desde_instalador(ruta_instalador):
+    """Primera apertura tras el instalador Inno: lee el bloque del instalador."""
+    trailer = leer_trailer(ruta_instalador) or {}
+    log("instalador %s → trailer %s" % (ruta_instalador, "encontrado (%s)" % trailer.get("persona", "") if trailer else "ausente"))
+    token = trailer.get("device_token", "")
+    if token:
+        guardar_config({
+            "device_token": token,
+            "supabase_url": trailer.get("supabase_url", ""),
+            "anon_key": trailer.get("anon_key", ""),
+            "empresa": trailer.get("empresa", ""),
+            "persona": trailer.get("persona", ""),
+        })
+        return trailer
+    if leer_config_guardada().get("device_token"):
+        return leer_config_guardada()  # reinstalación: ya estaba vinculado
+    ventana_mensaje("No se pudo vincular",
+                    "Este instalador no viene vinculado a tu cuenta.\n\n"
+                    "Descarga Mishop Monitor desde tu CRM, en la sección\n"
+                    "\"Mi rendimiento\" → \"Instalar Mishop Monitor en esta PC\".")
+    return None
 
 
 def instalar_desde_descarga():
@@ -467,16 +501,29 @@ def correr_bandeja():
 def main():
     global CFG
     log("arranque v%s desde %s" % (VERSION, ruta_exe()))
-    corriendo_instalado = os.path.normcase(ruta_exe()) == os.path.normcase(INSTALLED_EXE)
+    args = sys.argv[1:]
+    mostrar_listo = None
 
-    if es_exe_congelado() and not corriendo_instalado:
-        # Abierto desde Descargas: instalar y salir. La copia instalada sigue sola.
+    if "--instalador" in args:
+        # Nos abrió el instalador Inno al terminar: leer el bloque de vinculación.
+        i = args.index("--instalador")
+        ruta = args[i + 1] if i + 1 < len(args) else ""
+        cerrar_instancia_instalada()
+        datos = vincular_desde_instalador(ruta)
+        if not datos:
+            return
+        mostrar_listo = datos
+    elif es_exe_congelado() and not corre_desde_instalacion():
+        # Modo antiguo: .exe suelto con bloque pegado → se instala solo y sale.
         instalar_desde_descarga()
         return
 
     if not instancia_unica():
         log("ya hay una instancia; salgo")
         return
+
+    if mostrar_listo is not None:
+        threading.Thread(target=ventana_listo, args=(mostrar_listo.get("persona", ""), mostrar_listo.get("empresa", "")), daemon=True).start()
 
     CFG = armar_config()
     if not CFG.get("device_token"):
