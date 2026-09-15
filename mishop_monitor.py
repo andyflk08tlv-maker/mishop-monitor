@@ -19,7 +19,7 @@ from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -28,6 +28,7 @@ CONFIG_BASE = {
     "sample_interval_seconds": 15, "flush_interval_seconds": 60,
     "idle_threshold_seconds": 300, "screenshot_interval_minutes": 5,
     "auto_end_idle_minutes": 60,  # cierra el turno solo si no hay actividad por este tiempo
+    "limits_check_seconds": 180,  # cada cuánto relee los límites que el dueño configuró en el CRM
     "resume_window_minutes": 30,  # si reinició estando Activo hace poco, reanuda sin preguntar
     # Auto-actualización: la app se mantiene al día sola (el trabajador no hace nada).
     "version_url": "https://github.com/andyflk08tlv-maker/mishop-monitor/releases/download/latest/version.json",
@@ -119,6 +120,7 @@ def armar_config():
     cfg.update(leer_config_guardada())
     base = cfg["supabase_url"].rstrip("/") + "/rest/v1/rpc/"
     for k, fn in (("ingest_url", "ingest_activity"), ("settings_url", "get_monitor_settings"),
+                  ("limits_url", "get_monitor_limits"),
                   ("screenshot_url", "ingest_screenshot"), ("pausa_iniciar_url", "pausa_iniciar"),
                   ("pausa_terminar_url", "pausa_terminar"),
                   ("confirmar_url", "confirmar_comando"), ("reportar_url", "reportar_estado")):
@@ -543,6 +545,24 @@ def leer_settings():
     return None
 
 
+def leer_limites():
+    """Lee del CRM los límites que el dueño configuró para su empresa:
+    - idle_threshold_minutes: a los cuántos minutos sin mover mouse/teclado se marca "inactivo".
+    - auto_end_idle_minutes: a los cuántos minutos de inactividad se cierra el turno solo.
+    Si falla (sin conexión, versión vieja de la base, etc.), devuelve None y se usan los valores por defecto."""
+    try:
+        data = json.dumps({"p_device_token": CFG["device_token"]}).encode("utf-8")
+        req = urlrequest.Request(CFG["limits_url"], data=data, method="POST", headers={
+            "Content-Type": "application/json", "apikey": CFG["anon_key"], "Authorization": "Bearer " + CFG["anon_key"]})
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            d = json.loads(resp.read().decode("utf-8"))
+            if isinstance(d, dict) and d.get("ok"):
+                return d
+    except Exception as e:
+        log("limites fallo: %r" % (e,))
+    return None
+
+
 def aplicar_comando(cmd, motivo=""):
     """Aplica una orden que llegó desde el CRM."""
     cmd = (cmd or "").strip().lower()
@@ -567,9 +587,22 @@ def bucle_monitoreo():
     global _auto_terminado, _ultimo_comando_id
     pendientes = []; ultimo_flush = time.time(); ultima_captura = 0; ultimo_comando = 0
     shot_enabled = True; shot_interval = CFG["screenshot_interval_minutes"] * 60
+    # Estos dos los puede cambiar el dueño desde el CRM; arrancan con los valores por defecto
+    # y se refrescan cada rato con leer_limites().
+    idle_thr = max(30, int(CFG.get("idle_threshold_seconds", 300)))
     auto_end = max(5, int(CFG.get("auto_end_idle_minutes", 60))) * 60
+    ultimo_limites = 0
     host = socket.gethostname()
     while True:
+        # --- Límites configurados por el dueño en el CRM (inactividad / cierre automático) ---
+        if time.time() - ultimo_limites >= max(60, int(CFG.get("limits_check_seconds", 180))):
+            ultimo_limites = time.time()
+            lm = leer_limites()
+            if lm:
+                try: idle_thr = max(30, int(float(lm.get("idle_threshold_minutes", 5)) * 60))
+                except Exception: pass
+                try: auto_end = max(5 * 60, int(float(lm.get("auto_end_idle_minutes", 60)) * 60))
+                except Exception: pass
         # --- Órdenes desde el CRM (funciona en cualquier estado; casi inmediato) ---
         if time.time() - ultimo_comando >= 25:
             ultimo_comando = time.time()
@@ -615,7 +648,7 @@ def bucle_monitoreo():
         app_name, titulo = ventana_activa()
         pendientes.append({"captured_at": datetime.now(timezone.utc).isoformat(),
             "active_app": app_name, "window_title": titulo, "idle_seconds": round(idle, 1),
-            "is_idle": idle >= CFG["idle_threshold_seconds"], "hostname": host, "os": "windows"})
+            "is_idle": idle >= idle_thr, "hostname": host, "os": "windows"})
         if time.time() - ultimo_flush >= CFG["flush_interval_seconds"] and pendientes:
             if enviar_muestras(pendientes):
                 log("enviadas %d muestras" % len(pendientes)); pendientes = []
