@@ -19,7 +19,7 @@ from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -506,6 +506,24 @@ def ventana_activa():
     return app_name, titulo
 
 
+def _activar_conciencia_dpi():
+    """Windows: sin esto, con el escalado de pantalla tipico (125 %/150 %),
+    Windows le miente al proceso sobre el tamano real y la captura sale
+    RECORTADA a la esquina superior izquierda. Declararse consciente del DPI
+    hace que la captura sea la pantalla completa de verdad. En Mac no aplica.
+    Pedido por Andy (15-sep-2026): la captura debe ser pantalla completa."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
 def capturar_pantalla_jpeg():
     try:
         from PIL import ImageGrab
@@ -965,6 +983,7 @@ def correr_bandeja():
 
 def main():
     global CFG
+    _activar_conciencia_dpi()
     log("arranque v%s desde %s" % (VERSION, ruta_exe()))
     args = sys.argv[1:]
     mostrar_listo = None
