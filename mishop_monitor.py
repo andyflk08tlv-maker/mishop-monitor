@@ -12,14 +12,14 @@ Activo (verde) / En pausa (ámbar) / Turno terminado (gris).
 (Se conserva el modo antiguo: si el .exe se abre desde fuera de su carpeta de
 instalación y trae el bloque pegado, se instala solo en %LOCALAPPDATA%.)
 """
-import os, io, sys, json, time, base64, socket, shutil, tempfile, threading, ctypes, subprocess
+import os, io, sys, json, time, uuid, base64, socket, shutil, tempfile, threading, ctypes, subprocess
 from ctypes import wintypes
 from datetime import datetime, timezone
 from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -118,9 +118,17 @@ def guardar_config(extra):
 def armar_config():
     cfg = dict(CONFIG_BASE)
     cfg.update(leer_config_guardada())
+    # Identificador estable de ESTA computadora (una por instalación). Sirve para el
+    # candado de "una sola PC activa por persona". Se guarda y sobrevive a las
+    # actualizaciones; solo se borra al desinstalar.
+    if not cfg.get("machine_id"):
+        mid = uuid.uuid4().hex
+        try: guardar_config({"machine_id": mid})
+        except Exception: pass
+        cfg["machine_id"] = mid
     base = cfg["supabase_url"].rstrip("/") + "/rest/v1/rpc/"
     for k, fn in (("ingest_url", "ingest_activity"), ("settings_url", "get_monitor_settings"),
-                  ("limits_url", "get_monitor_limits"),
+                  ("limits_url", "get_monitor_limits"), ("reclamar_url", "reclamar_equipo"),
                   ("screenshot_url", "ingest_screenshot"), ("pausa_iniciar_url", "pausa_iniciar"),
                   ("pausa_terminar_url", "pausa_terminar"),
                   ("confirmar_url", "confirmar_comando"), ("reportar_url", "reportar_estado")):
@@ -563,6 +571,77 @@ def leer_limites():
     return None
 
 
+def reclamar_equipo():
+    """Candado: una sola computadora activa por persona.
+    Le dice al CRM 'soy esta PC (machine_id) y estoy trabajando'. El servidor
+    responde {'ok':True,'granted':True} si me toca, o {'granted':False} si esa
+    persona ya está reportando desde OTRA PC. Devuelve None si no se pudo pedir
+    (sin conexión, o base sin la función todavía): en ese caso el que llama asume
+    que SÍ le toca, para no romper lo que ya funcionaba."""
+    try:
+        data = json.dumps({"p_device_token": CFG["device_token"], "p_machine_id": CFG.get("machine_id", "")}).encode("utf-8")
+        req = urlrequest.Request(CFG["reclamar_url"], data=data, method="POST", headers={
+            "Content-Type": "application/json", "apikey": CFG["anon_key"], "Authorization": "Bearer " + CFG["anon_key"]})
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            d = json.loads(resp.read().decode("utf-8"))
+            if isinstance(d, dict) and d.get("ok"):
+                return d
+    except Exception as e:
+        log("reclamar fallo: %r" % (e,))
+    return None
+
+
+def notificar_otra_pc():
+    """Avisa al trabajador, una vez, que ya está activo en otra computadora."""
+    msg = ("Ya estás activo en otra computadora. Este equipo no contará tu "
+           "actividad hasta que cierres el monitor en la otra PC.")
+    try:
+        if icono is not None and hasattr(icono, "notify"):
+            icono.notify(msg, APP_NAME)
+            return
+    except Exception:
+        pass
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        def _w():
+            try:
+                root = tk.Tk(); root.withdraw()
+                try: root.attributes("-topmost", True)
+                except Exception: pass
+                messagebox.showinfo(APP_NAME, msg)
+                root.destroy()
+            except Exception:
+                pass
+        threading.Thread(target=_w, daemon=True).start()
+    except Exception:
+        pass
+
+
+def _cambio_equipo(tengo):
+    """Se llama cuando cambia si esta PC tiene o no el control del monitoreo."""
+    global _aviso_otra_pc
+    if not tengo:
+        log("candado: otra PC está activa; este equipo deja de contar")
+        try:
+            if icono is not None:
+                icono.title = APP_NAME + " · Activo en otra PC"
+        except Exception:
+            pass
+        if not _aviso_otra_pc:
+            _aviso_otra_pc = True
+            notificar_otra_pc()
+    else:
+        if _aviso_otra_pc:
+            log("candado: este equipo toma el control del monitoreo")
+        _aviso_otra_pc = False
+        try:
+            if icono is not None:
+                icono.title = titulo_estado()
+        except Exception:
+            pass
+
+
 def aplicar_comando(cmd, motivo=""):
     """Aplica una orden que llegó desde el CRM."""
     cmd = (cmd or "").strip().lower()
@@ -584,7 +663,7 @@ def aplicar_comando(cmd, motivo=""):
 
 
 def bucle_monitoreo():
-    global _auto_terminado, _ultimo_comando_id
+    global _auto_terminado, _ultimo_comando_id, _tengo_equipo
     pendientes = []; ultimo_flush = time.time(); ultima_captura = 0; ultimo_comando = 0
     shot_enabled = True; shot_interval = CFG["screenshot_interval_minutes"] * 60
     # Estos dos los puede cambiar el dueño desde el CRM; arrancan con los valores por defecto
@@ -594,34 +673,46 @@ def bucle_monitoreo():
     ultimo_limites = 0
     host = socket.gethostname()
     while True:
-        # --- Límites configurados por el dueño en el CRM (inactividad / cierre automático) ---
-        if time.time() - ultimo_limites >= max(60, int(CFG.get("limits_check_seconds", 180))):
-            ultimo_limites = time.time()
-            lm = leer_limites()
-            if lm:
-                try: idle_thr = max(30, int(float(lm.get("idle_threshold_minutes", 5)) * 60))
-                except Exception: pass
-                try: auto_end = max(5 * 60, int(float(lm.get("auto_end_idle_minutes", 60)) * 60))
-                except Exception: pass
-        # --- Órdenes desde el CRM (funciona en cualquier estado; casi inmediato) ---
+        # --- Chequeo periódico (~25s): candado de 1 PC, límites y órdenes del CRM ---
         if time.time() - ultimo_comando >= 25:
             ultimo_comando = time.time()
-            s = leer_settings()
-            if s:
-                shot_enabled = bool(s.get("screenshots_enabled", True))
-                shot_interval = max(1, int(s.get("screenshot_interval_minutes", 5))) * 60
-                try:
-                    cid = int(s.get("comando_id") or 0)
-                except Exception:
-                    cid = 0
-                cmd = s.get("comando")
-                if cmd and cid > _ultimo_comando_id:
-                    aplicar_comando(cmd, s.get("comando_motivo") or "")
-                    _ultimo_comando_id = cid
-                    try: confirmar_comando(cid)
-                    except Exception: pass
-            try: reportar_estado()
-            except Exception: pass
+            # Candado: ¿me toca contar a MÍ, o esta persona ya está en otra PC?
+            rc = reclamar_equipo()
+            if rc is not None:
+                nuevo = bool(rc.get("granted", True))
+                if nuevo != _tengo_equipo:
+                    _tengo_equipo = nuevo
+                    _cambio_equipo(_tengo_equipo)
+            if _tengo_equipo:
+                # Límites configurados por el dueño (inactividad / cierre automático)
+                if time.time() - ultimo_limites >= max(60, int(CFG.get("limits_check_seconds", 180))):
+                    ultimo_limites = time.time()
+                    lm = leer_limites()
+                    if lm:
+                        try: idle_thr = max(30, int(float(lm.get("idle_threshold_minutes", 5)) * 60))
+                        except Exception: pass
+                        try: auto_end = max(5 * 60, int(float(lm.get("auto_end_idle_minutes", 60)) * 60))
+                        except Exception: pass
+                # Órdenes desde el CRM (funciona en cualquier estado; casi inmediato)
+                s = leer_settings()
+                if s:
+                    shot_enabled = bool(s.get("screenshots_enabled", True))
+                    shot_interval = max(1, int(s.get("screenshot_interval_minutes", 5))) * 60
+                    try:
+                        cid = int(s.get("comando_id") or 0)
+                    except Exception:
+                        cid = 0
+                    cmd = s.get("comando")
+                    if cmd and cid > _ultimo_comando_id:
+                        aplicar_comando(cmd, s.get("comando_motivo") or "")
+                        _ultimo_comando_id = cid
+                        try: confirmar_comando(cid)
+                        except Exception: pass
+                try: reportar_estado()
+                except Exception: pass
+        # Si esta persona ya está activa en otra PC, este equipo no cuenta nada.
+        if not _tengo_equipo:
+            pendientes = []; time.sleep(2); continue
         with _lock:
             activo = (estado == Estado.ACTIVO)
             apagado = (estado == Estado.APAGADO)
@@ -667,6 +758,8 @@ icono = None
 _auto_terminado = False   # el último fin de turno fue por inactividad (para volver a ofrecer empezar)
 _prompt_abierto = False   # hay una ventana "Empezar mi turno" abierta ahora
 _ultimo_comando_id = 0    # último comando del CRM ya aplicado
+_tengo_equipo = True      # candado: esta PC tiene el control del monitoreo (1 por persona)
+_aviso_otra_pc = False    # ya se avisó "estás activo en otra PC" (para no repetir)
 
 
 def ventana_empezar_turno(persona=""):
