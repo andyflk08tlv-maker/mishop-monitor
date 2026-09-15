@@ -19,7 +19,7 @@ from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -956,7 +956,10 @@ def correr_bandeja():
         pystray.MenuItem("Terminar turno", accion_terminar, visible=lambda item: _es(Estado.ACTIVO) or _es(Estado.PAUSA)),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Versión " + VERSION, None, enabled=False),
-        pystray.MenuItem("Salir", accion_salir),
+        # "Salir" se quitó a propósito: el trabajador no debe poder apagar el
+        # monitoreo por completo de un clic. Puede terminar su turno (sigue vivo
+        # el iconito), pero no cerrar la app. La actualización y el desinstalador
+        # cierran la app por su cuenta cuando toca.
     )
     icono = pystray.Icon("mishop_monitor", icon=imagen_icono(), title=titulo_estado(), menu=MENU)
     threading.Thread(target=bucle_monitoreo, daemon=True).start()
