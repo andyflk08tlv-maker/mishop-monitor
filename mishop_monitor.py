@@ -19,12 +19,14 @@ from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
     "anon_key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR4b2ttdnFxamZieGdxbGhjaXJlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk2NjA0NjUsImV4cCI6MjA5NTIzNjQ2NX0.CPgX8-gk6lErosTie8V8rS2Uxf0lSOVf_GJRyvz4BZM",
     "device_token": "",
+    # El CRM recibe las capturas y las guarda en Storage (no dentro de la base).
+    "crm_url": "https://mishopapp.com",
     "sample_interval_seconds": 15, "flush_interval_seconds": 60,
     "idle_threshold_seconds": 300, "screenshot_interval_minutes": 5,
     "auto_end_idle_minutes": 60,  # cierra el turno solo si no hay actividad por este tiempo
@@ -133,6 +135,7 @@ def armar_config():
                   ("pausa_terminar_url", "pausa_terminar"),
                   ("confirmar_url", "confirmar_comando"), ("reportar_url", "reportar_estado")):
         cfg[k] = base + fn
+    cfg["captura_url"] = cfg["crm_url"].rstrip("/") + "/api/monitor/captura"
     return cfg
 
 
@@ -528,13 +531,33 @@ def _post(url, payload):
         return False
 
 
+def _post_binario(url, datos):
+    """Manda bytes tal cual (sin base64, que infla un 33%)."""
+    try:
+        req = urlrequest.Request(url, data=datos, method="POST",
+                                 headers={"Content-Type": "image/jpeg"})
+        with urlrequest.urlopen(req, timeout=30) as resp:
+            return 200 <= resp.status < 300
+    except Exception as e:
+        log("captura a Storage fallo: %r" % (e,))
+        return False
+
+
 def confirmar_comando(cid): return _post(CFG["confirmar_url"], {"p_device_token": CFG["device_token"], "p_comando_id": cid, "p_estado": estado})
 def reportar_estado(): return _post(CFG["reportar_url"], {"p_device_token": CFG["device_token"], "p_estado": estado})
 def _reportar_estado_seguro():
     try: reportar_estado()
     except Exception: pass
 def enviar_muestras(m): return _post(CFG["ingest_url"], {"p_device_token": CFG["device_token"], "p_samples": m})
-def enviar_captura(ts, b): return _post(CFG["screenshot_url"], {"p_device_token": CFG["device_token"], "p_captured_at": ts, "p_image_b64": base64.b64encode(b).decode("ascii")})
+def enviar_captura(ts, b):
+    """La captura va a Storage por el CRM; si eso falla, se usa el camino viejo."""
+    from urllib.parse import quote
+    url = "%s?token=%s&at=%s" % (CFG["captura_url"], CFG["device_token"], quote(ts))
+    if _post_binario(url, b):
+        return True
+    return _post(CFG["screenshot_url"], {"p_device_token": CFG["device_token"],
+                                         "p_captured_at": ts,
+                                         "p_image_b64": base64.b64encode(b).decode("ascii")})
 def pausa_iniciar(tipo, motivo): _post(CFG["pausa_iniciar_url"], {"p_device_token": CFG["device_token"], "p_tipo": tipo, "p_motivo": motivo or ""})
 def pausa_terminar(): _post(CFG["pausa_terminar_url"], {"p_device_token": CFG["device_token"]})
 
