@@ -19,7 +19,7 @@ from urllib import request as urlrequest
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.9.1"
+VERSION = "1.9.2"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -703,6 +703,14 @@ def aplicar_comando(cmd, motivo=""):
     log("comando del CRM aplicado: %s %s" % (cmd, motivo))
 
 
+# Latido con el turno cerrado: cada cuanto se anota una muestra "inactiva" para
+# que el dia quede completo en el CRM (sin huecos "Sin datos"), y a partir de
+# cuanta inactividad se deja de anotar (a esa altura la persona ya se fue y no
+# tiene sentido llenar la base con la PC prendida toda la noche).
+LATIDO_SEG = 60
+LATIDO_TOPE_SEG = 3 * 3600
+
+
 def bucle_monitoreo():
     global _auto_terminado, _ultimo_comando_id, _tengo_equipo
     pendientes = []; ultimo_flush = time.time(); ultima_captura = 0; ultimo_comando = 0
@@ -758,11 +766,43 @@ def bucle_monitoreo():
             activo = (estado == Estado.ACTIVO)
             apagado = (estado == Estado.APAGADO)
         if not activo:
-            # Si el turno se cerró solo por inactividad y la persona volvió a la PC,
-            # se le vuelve a ofrecer empezar (un clic), sin contar el tiempo que estuvo fuera.
+            # El turno se cerró SOLO (por inactividad) y la persona volvió a tocar la
+            # PC: se reanuda sin pedirle nada.
+            #
+            # Antes se le abría una ventanita con el botón "Empezar mi turno". Nadie
+            # la miraba, así que el resto del día no se anotaba: el 21-sep-2026, en
+            # Ireca Shop, turnos de 11 horas aparecían como 2 h y hasta 4 "Fin de
+            # turno" en un mismo día, con el agente prendido y reportando. Pedido de
+            # Andy: que se reanude solo.
+            #
+            # El turno terminado a mano NO se reanuda: si la persona apretó "Terminar
+            # turno", se respeta (_auto_terminado solo lo marca el cierre automático).
             if apagado and _auto_terminado and segundos_inactivo() < 60:
                 _auto_terminado = False
-                mostrar_prompt_empezar()
+                try:
+                    pausa_terminar()
+                except Exception:
+                    pass
+                set_estado(Estado.ACTIVO)
+                log("turno reanudado solo: la persona volvio a la PC")
+                continue
+            # Mientras el turno esta cerrado SOLO, se sigue anotando una muestra por
+            # minuto marcada como inactiva: el dia queda completo en el CRM, pintado
+            # "Inactivo" en vez de un hueco "Sin datos" (Andy, 21-sep-2026:
+            # "registrar todo"). No se guarda ni app ni pestana: la persona no esta.
+            # El turno terminado A MANO no late: si apreto "Terminar turno", se
+            # respeta y no se anota nada.
+            if apagado and _auto_terminado:
+                inact = segundos_inactivo()
+                if inact < LATIDO_TOPE_SEG:
+                    pendientes.append({"captured_at": datetime.now(timezone.utc).isoformat(),
+                        "active_app": None, "window_title": None, "idle_seconds": round(inact, 1),
+                        "is_idle": True, "hostname": host, "os": "windows"})
+                    if enviar_muestras(pendientes):
+                        pendientes = []
+                    ultimo_flush = time.time()
+                time.sleep(LATIDO_SEG)
+                continue
             pendientes = []; time.sleep(2); continue
         idle = segundos_inactivo()
         # Cerrar el turno solo si lleva mucho rato sin actividad (no contar la noche
@@ -859,14 +899,6 @@ def ventana_empezar_turno(persona=""):
         root.mainloop()
     finally:
         _prompt_abierto = False
-
-
-def mostrar_prompt_empezar():
-    """Abre el avisito de empezar turno en su propio hilo (sin bloquear el monitoreo)."""
-    if _prompt_abierto:
-        return
-    quien = (leer_config_guardada().get("persona") or "").strip()
-    threading.Thread(target=ventana_empezar_turno, args=(quien,), daemon=True).start()
 
 
 def imagen_icono():
