@@ -16,10 +16,11 @@ import os, io, sys, json, time, uuid, base64, socket, shutil, tempfile, threadin
 from ctypes import wintypes
 from datetime import datetime, timezone
 from urllib import request as urlrequest
+from urllib.error import HTTPError
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.9.1"
+VERSION = "1.9.2"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -550,12 +551,25 @@ def _post(url, payload):
 
 
 def _post_binario(url, datos):
-    """Manda bytes tal cual (sin base64, que infla un 33%)."""
+    """Manda bytes tal cual (sin base64, que infla un 33%).
+
+    v1.9.2: con la cabecera que Python pone por defecto ("Python-urllib/3.x")
+    el CRM respondía 403 antes de llegar a la ruta (la ruta nunca contesta
+    403), y todas las capturas volvían a guardarse dentro de la base. Ahora se
+    presenta como Mishop Monitor, igual que la auto-actualización. Si vuelve a
+    fallar, el registro guarda el código y el comienzo de la respuesta."""
     try:
-        req = urlrequest.Request(url, data=datos, method="POST",
-                                 headers={"Content-Type": "image/jpeg"})
+        req = urlrequest.Request(url, data=datos, method="POST", headers={
+            "Content-Type": "image/jpeg",
+            "User-Agent": "MishopMonitor/%s" % VERSION})
         with urlrequest.urlopen(req, timeout=30) as resp:
             return 200 <= resp.status < 300
+    except HTTPError as e:
+        cuerpo = ""
+        try: cuerpo = e.read(200).decode("utf-8", "replace").replace("\n", " ")
+        except Exception: pass
+        log("captura a Storage fallo: HTTP %s %s | %s" % (e.code, e.headers.get("cf-ray", ""), cuerpo))
+        return False
     except Exception as e:
         log("captura a Storage fallo: %r" % (e,))
         return False
