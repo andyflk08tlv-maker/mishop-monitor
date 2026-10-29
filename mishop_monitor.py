@@ -20,7 +20,7 @@ from urllib.error import HTTPError
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.9.2"
+VERSION = "1.9.3"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -137,6 +137,8 @@ def armar_config():
                   ("confirmar_url", "confirmar_comando"), ("reportar_url", "reportar_estado")):
         cfg[k] = base + fn
     cfg["captura_url"] = cfg["crm_url"].rstrip("/") + "/api/monitor/captura"
+    # v1.9.3: las funciones de la base van primero por el CRM (ver _rpc).
+    cfg["crm_rpc_url"] = cfg["crm_url"].rstrip("/") + "/api/monitor/rpc/"
     return cfg
 
 
@@ -575,12 +577,74 @@ def _post_binario(url, datos):
         return False
 
 
-def confirmar_comando(cid): return _post(CFG["confirmar_url"], {"p_device_token": CFG["device_token"], "p_comando_id": cid, "p_estado": estado})
-def reportar_estado(): return _post(CFG["reportar_url"], {"p_device_token": CFG["device_token"], "p_estado": estado})
+_fallas_avisadas = set()
+
+
+def _avisar_una_vez(clave, msg):
+    """El registro guarda la primera falla de cada camino, no una cada 25 s."""
+    if clave in _fallas_avisadas:
+        return
+    _fallas_avisadas.add(clave)
+    log(msg)
+
+
+def _leer_json(resp):
+    try:
+        cuerpo = resp.read().decode("utf-8")
+        return json.loads(cuerpo) if cuerpo.strip() else {}
+    except Exception:
+        return {}
+
+
+def _rpc(fn, payload):
+    """Llama una función de la base. v1.9.3: PRIMERO POR EL CRM.
+
+    Hasta 1.9.2 se llamaba a la base directo, con la dirección guardada al
+    instalar. El 5-oct-2026 el CRM se mudó a una base nueva y los monitores
+    instalados antes siguieron mandando actividad, estado y órdenes a la vieja:
+    solo las capturas (que ya iban por el CRM) llegaban, y el CRM decía
+    «apagado» a gente que estaba trabajando. Ahora el CRM reenvía a la base que
+    tenga ese día. Si el CRM no contesta bien, se prueba el camino viejo.
+    Devuelve lo que contesta la función (dict) o None si no se pudo."""
+    datos = json.dumps(payload).encode("utf-8")
+    try:
+        req = urlrequest.Request(CFG["crm_rpc_url"] + fn, data=datos, method="POST", headers={
+            "Content-Type": "application/json", "User-Agent": "MishopMonitor/%s" % VERSION})
+        with urlrequest.urlopen(req, timeout=20) as resp:
+            if 200 <= resp.status < 300:
+                _fallas_avisadas.discard("crm " + fn)
+                return _leer_json(resp)
+    except Exception as e:
+        _avisar_una_vez("crm " + fn, "crm %s fallo, pruebo directo: %r" % (fn, e))
+    try:
+        req = urlrequest.Request(CFG["supabase_url"].rstrip("/") + "/rest/v1/rpc/" + fn, data=datos, method="POST", headers={
+            "Content-Type": "application/json", "apikey": CFG["anon_key"],
+            "Authorization": "Bearer " + CFG["anon_key"]})
+        with urlrequest.urlopen(req, timeout=20) as resp:
+            if 200 <= resp.status < 300:
+                return _leer_json(resp)
+    except Exception as e:
+        log("post fallo %s: %r" % (fn, e))
+    return None
+
+
+def _rpc_ok(fn, payload):
+    """Como _rpc, pero solo importa si respondió (para lo que no devuelve datos)."""
+    return _rpc(fn, payload) is not None
+
+
+def _rpc_dict(fn, payload):
+    """Como _rpc, pero solo si la función dijo ok (ajustes, límites, candado)."""
+    d = _rpc(fn, payload)
+    return d if isinstance(d, dict) and d.get("ok") else None
+
+
+def confirmar_comando(cid): return _rpc_ok("confirmar_comando", {"p_device_token": CFG["device_token"], "p_comando_id": cid, "p_estado": estado})
+def reportar_estado(): return _rpc_ok("reportar_estado", {"p_device_token": CFG["device_token"], "p_estado": estado})
 def _reportar_estado_seguro():
     try: reportar_estado()
     except Exception: pass
-def enviar_muestras(m): return _post(CFG["ingest_url"], {"p_device_token": CFG["device_token"], "p_samples": m})
+def enviar_muestras(m): return _rpc_ok("ingest_activity", {"p_device_token": CFG["device_token"], "p_samples": m})
 def enviar_captura(ts, b):
     """La captura va a Storage por el CRM; si eso falla, se usa el camino viejo."""
     from urllib.parse import quote
@@ -590,22 +654,12 @@ def enviar_captura(ts, b):
     return _post(CFG["screenshot_url"], {"p_device_token": CFG["device_token"],
                                          "p_captured_at": ts,
                                          "p_image_b64": base64.b64encode(b).decode("ascii")})
-def pausa_iniciar(tipo, motivo): _post(CFG["pausa_iniciar_url"], {"p_device_token": CFG["device_token"], "p_tipo": tipo, "p_motivo": motivo or ""})
-def pausa_terminar(): _post(CFG["pausa_terminar_url"], {"p_device_token": CFG["device_token"]})
+def pausa_iniciar(tipo, motivo): _rpc_ok("pausa_iniciar", {"p_device_token": CFG["device_token"], "p_tipo": tipo, "p_motivo": motivo or ""})
+def pausa_terminar(): _rpc_ok("pausa_terminar", {"p_device_token": CFG["device_token"]})
 
 
 def leer_settings():
-    try:
-        data = json.dumps({"p_device_token": CFG["device_token"]}).encode("utf-8")
-        req = urlrequest.Request(CFG["settings_url"], data=data, method="POST", headers={
-            "Content-Type": "application/json", "apikey": CFG["anon_key"], "Authorization": "Bearer " + CFG["anon_key"]})
-        with urlrequest.urlopen(req, timeout=15) as resp:
-            d = json.loads(resp.read().decode("utf-8"))
-            if isinstance(d, dict) and d.get("ok"):
-                return d
-    except Exception as e:
-        log("settings fallo: %r" % (e,))
-    return None
+    return _rpc_dict("get_monitor_settings", {"p_device_token": CFG["device_token"]})
 
 
 def leer_limites():
@@ -613,17 +667,7 @@ def leer_limites():
     - idle_threshold_minutes: a los cuántos minutos sin mover mouse/teclado se marca "inactivo".
     - auto_end_idle_minutes: a los cuántos minutos de inactividad se cierra el turno solo.
     Si falla (sin conexión, versión vieja de la base, etc.), devuelve None y se usan los valores por defecto."""
-    try:
-        data = json.dumps({"p_device_token": CFG["device_token"]}).encode("utf-8")
-        req = urlrequest.Request(CFG["limits_url"], data=data, method="POST", headers={
-            "Content-Type": "application/json", "apikey": CFG["anon_key"], "Authorization": "Bearer " + CFG["anon_key"]})
-        with urlrequest.urlopen(req, timeout=15) as resp:
-            d = json.loads(resp.read().decode("utf-8"))
-            if isinstance(d, dict) and d.get("ok"):
-                return d
-    except Exception as e:
-        log("limites fallo: %r" % (e,))
-    return None
+    return _rpc_dict("get_monitor_limits", {"p_device_token": CFG["device_token"]})
 
 
 def reclamar_equipo():
@@ -633,17 +677,7 @@ def reclamar_equipo():
     persona ya está reportando desde OTRA PC. Devuelve None si no se pudo pedir
     (sin conexión, o base sin la función todavía): en ese caso el que llama asume
     que SÍ le toca, para no romper lo que ya funcionaba."""
-    try:
-        data = json.dumps({"p_device_token": CFG["device_token"], "p_machine_id": CFG.get("machine_id", "")}).encode("utf-8")
-        req = urlrequest.Request(CFG["reclamar_url"], data=data, method="POST", headers={
-            "Content-Type": "application/json", "apikey": CFG["anon_key"], "Authorization": "Bearer " + CFG["anon_key"]})
-        with urlrequest.urlopen(req, timeout=15) as resp:
-            d = json.loads(resp.read().decode("utf-8"))
-            if isinstance(d, dict) and d.get("ok"):
-                return d
-    except Exception as e:
-        log("reclamar fallo: %r" % (e,))
-    return None
+    return _rpc_dict("reclamar_equipo", {"p_device_token": CFG["device_token"], "p_machine_id": CFG.get("machine_id", "")})
 
 
 def notificar_otra_pc():
