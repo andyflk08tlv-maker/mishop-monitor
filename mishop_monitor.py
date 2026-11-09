@@ -11,8 +11,22 @@ Desde ahí vive como iconito en la bandeja con tres estados:
 Activo (verde) / En pausa (ámbar) / Turno terminado (gris).
 (Se conserva el modo antiguo: si el .exe se abre desde fuera de su carpeta de
 instalación y trae el bloque pegado, se instala solo en %LOCALAPPDATA%.)
+
+v1.9.4 (9-nov-2026): el aviso «estoy vivo» va aparte. Hasta 1.9.3 todo iba
+en una sola fila (candado, límites, órdenes, estado, muestras, captura) y con
+WiFi débil cada paso esperaba hasta 20 s + 20 s: una vuelta llegaba a ~4 min
+y el CRM bloqueaba con «Tu monitor no responde» a gente trabajando (Arianna y
+Luz, Ireca, 9-nov). Ahora hay cuatro hilos que no se esperan entre sí:
+  - latido: estado + candado + límites + órdenes cada 25 s, con esperas cortas;
+  - muestreo: una muestra cada 15 s y la captura cuando toca (solo local);
+  - subidas: muestras y capturas, con reintento (nada se bota);
+  - avisos: pausas y fines de turno en orden, con reintento.
+El iconito cambia al instante y avisa detrás. config.json se guarda de a uno
+y de forma atómica. El registro se recorta solo. La actualización se revisa
+cada 30 min y el CRM puede ordenar «actualizar»; al reabrirse vuelve al
+estado en que estaba (también en pausa).
 """
-import os, io, sys, json, time, uuid, base64, socket, shutil, tempfile, threading, ctypes, subprocess
+import os, io, sys, json, time, uuid, base64, socket, shutil, tempfile, threading, ctypes, subprocess, collections
 from ctypes import wintypes
 from datetime import datetime, timezone
 from urllib import request as urlrequest
@@ -20,7 +34,7 @@ from urllib.error import HTTPError
 
 APP_NAME = "Mishop Monitor"
 EXE_NAME = "Mishop Monitor.exe"
-VERSION = "1.9.3"
+VERSION = "1.9.4"
 
 CONFIG_BASE = {
     "supabase_url": "https://dxokmvqqjfbxgqlhcire.supabase.co",
@@ -36,7 +50,7 @@ CONFIG_BASE = {
     # Auto-actualización: la app se mantiene al día sola (el trabajador no hace nada).
     "version_url": "https://github.com/andyflk08tlv-maker/mishop-monitor/releases/download/latest/version.json",
     "setup_url": "https://github.com/andyflk08tlv-maker/mishop-monitor/releases/download/latest/MishopMonitorSetup.exe",
-    "update_check_hours": 6,
+    "update_check_minutes": 30,
 }
 
 TRAILER_INICIO = b"MISHOPCFG1"
@@ -59,11 +73,21 @@ def corre_desde_instalacion():
 
 
 # ----------------------------------------------------------------- utilidades
+LOG_MAX_BYTES = 1_000_000  # v1.9.4: al pasar ~1 MB se guarda como .1 y se empieza otro
+_log_lock = threading.Lock()
+
+
 def log(msg):
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + str(msg) + "\n")
+        with _log_lock:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            try:
+                if os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+                    os.replace(LOG_PATH, LOG_PATH + ".1")
+            except OSError:
+                pass
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " " + str(msg) + "\n")
     except Exception:
         pass
 
@@ -110,12 +134,26 @@ def leer_config_guardada():
     return {}
 
 
-def guardar_config(extra):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    actual = leer_config_guardada()
-    actual.update({k: v for k, v in extra.items() if v not in (None, "")})
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(actual, f, ensure_ascii=False, indent=2)
+_cfg_lock = threading.Lock()
+
+
+def guardar_config(extra, quitar=()):
+    """v1.9.4: de a uno (candado) y atómico (archivo temporal + reemplazo).
+    Antes varios hilos podían escribir a la vez y dejar config.json a medias;
+    sin el archivo legible se pierde el token y el monitor pide reinstalar."""
+    with _cfg_lock:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        actual = leer_config_guardada()
+        actual.update({k: v for k, v in extra.items() if v not in (None, "")})
+        for k in quitar:
+            actual.pop(k, None)
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(actual, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try: os.fsync(f.fileno())
+            except Exception: pass
+        os.replace(tmp, CONFIG_PATH)
 
 
 def armar_config():
@@ -439,6 +477,10 @@ def buscar_e_instalar_actualizacion():
                 'del "%%~f0"\r\n'
             )
         DETACHED = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED|NEW_GROUP|NO_WINDOW
+        # Al reabrirse, volver al estado en que estaba (activo o en pausa) sin
+        # preguntar: la actualización no es un turno nuevo.
+        try: guardar_config({"reabrir_tras_actualizar": datetime.now(timezone.utc).isoformat()})
+        except Exception: pass
         subprocess.Popen(["cmd", "/c", bat], creationflags=DETACHED, close_fds=True)
         log("instalando actualización %s y reabriendo; salgo" % remota)
         time.sleep(1.0)
@@ -447,15 +489,29 @@ def buscar_e_instalar_actualizacion():
         log("auto-actualización falló: %r" % (e,))
 
 
+_actualizando = threading.Lock()
+
+
+def actualizar_ya():
+    """Una sola revisión a la vez (la del reloj y la que ordena el CRM)."""
+    if not _actualizando.acquire(blocking=False):
+        return
+    try:
+        buscar_e_instalar_actualizacion()
+    finally:
+        _actualizando.release()
+
+
 def bucle_actualizaciones():
+    """v1.9.4: cada 30 min (antes cada 6 h). Revisar es leer un archivo chico."""
     time.sleep(45)  # dejar que arranque todo antes de la primera revisión
     while True:
-        buscar_e_instalar_actualizacion()
+        actualizar_ya()
         try:
-            horas = max(1, int(CFG.get("update_check_hours", 6)))
+            minutos = max(10, int(CFG.get("update_check_minutes", 30)))
         except Exception:
-            horas = 6
-        time.sleep(horas * 3600)
+            minutos = 30
+        time.sleep(minutos * 60)
 
 
 # ----------------------------------------------------------- monitoreo
@@ -596,7 +652,7 @@ def _leer_json(resp):
         return {}
 
 
-def _rpc(fn, payload):
+def _rpc(fn, payload, timeout=20):
     """Llama una función de la base. v1.9.3: PRIMERO POR EL CRM.
 
     Hasta 1.9.2 se llamaba a la base directo, con la dirección guardada al
@@ -605,12 +661,13 @@ def _rpc(fn, payload):
     solo las capturas (que ya iban por el CRM) llegaban, y el CRM decía
     «apagado» a gente que estaba trabajando. Ahora el CRM reenvía a la base que
     tenga ese día. Si el CRM no contesta bien, se prueba el camino viejo.
-    Devuelve lo que contesta la función (dict) o None si no se pudo."""
+    Devuelve lo que contesta la función (dict) o None si no se pudo.
+    v1.9.4: `timeout` por llamada; el latido usa uno corto (LATIDO_TIMEOUT)."""
     datos = json.dumps(payload).encode("utf-8")
     try:
         req = urlrequest.Request(CFG["crm_rpc_url"] + fn, data=datos, method="POST", headers={
             "Content-Type": "application/json", "User-Agent": "MishopMonitor/%s" % VERSION})
-        with urlrequest.urlopen(req, timeout=20) as resp:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
             if 200 <= resp.status < 300:
                 _fallas_avisadas.discard("crm " + fn)
                 return _leer_json(resp)
@@ -620,7 +677,7 @@ def _rpc(fn, payload):
         req = urlrequest.Request(CFG["supabase_url"].rstrip("/") + "/rest/v1/rpc/" + fn, data=datos, method="POST", headers={
             "Content-Type": "application/json", "apikey": CFG["anon_key"],
             "Authorization": "Bearer " + CFG["anon_key"]})
-        with urlrequest.urlopen(req, timeout=20) as resp:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
             if 200 <= resp.status < 300:
                 return _leer_json(resp)
     except Exception as e:
@@ -628,19 +685,28 @@ def _rpc(fn, payload):
     return None
 
 
-def _rpc_ok(fn, payload):
+LATIDO_TIMEOUT = 8  # v1.9.4: el latido no espera 20 s por llamada
+LATIDO_CADA = 25    # segundos entre latidos
+
+
+def _rpc_ok(fn, payload, timeout=20):
     """Como _rpc, pero solo importa si respondió (para lo que no devuelve datos)."""
-    return _rpc(fn, payload) is not None
+    return _rpc(fn, payload, timeout) is not None
 
 
-def _rpc_dict(fn, payload):
+def _rpc_dict(fn, payload, timeout=20):
     """Como _rpc, pero solo si la función dijo ok (ajustes, límites, candado)."""
-    d = _rpc(fn, payload)
+    d = _rpc(fn, payload, timeout)
     return d if isinstance(d, dict) and d.get("ok") else None
 
 
-def confirmar_comando(cid): return _rpc_ok("confirmar_comando", {"p_device_token": CFG["device_token"], "p_comando_id": cid, "p_estado": estado})
-def reportar_estado(): return _rpc_ok("reportar_estado", {"p_device_token": CFG["device_token"], "p_estado": estado})
+def _estado_ahora():
+    with _lock:
+        return estado
+
+
+def confirmar_comando(cid): return _rpc_ok("confirmar_comando", {"p_device_token": CFG["device_token"], "p_comando_id": cid, "p_estado": _estado_ahora()}, LATIDO_TIMEOUT)
+def reportar_estado(): return _rpc_ok("reportar_estado", {"p_device_token": CFG["device_token"], "p_estado": _estado_ahora()}, LATIDO_TIMEOUT)
 def _reportar_estado_seguro():
     try: reportar_estado()
     except Exception: pass
@@ -654,12 +720,37 @@ def enviar_captura(ts, b):
     return _post(CFG["screenshot_url"], {"p_device_token": CFG["device_token"],
                                          "p_captured_at": ts,
                                          "p_image_b64": base64.b64encode(b).decode("ascii")})
-def pausa_iniciar(tipo, motivo): _rpc_ok("pausa_iniciar", {"p_device_token": CFG["device_token"], "p_tipo": tipo, "p_motivo": motivo or ""})
-def pausa_terminar(): _rpc_ok("pausa_terminar", {"p_device_token": CFG["device_token"]})
+# --- Avisos en orden (v1.9.4): pausas y fines de turno ---
+# Antes se mandaban en el momento y, si fallaban, se perdían: el CRM no se
+# enteraba de la pausa. Ahora se encolan en orden y un hilo los manda hasta que
+# lleguen. Quien los pide (el menú del iconito) no espera a la red.
+_avisos = collections.deque(maxlen=500)
+_avisos_hay = threading.Event()
+
+
+def encolar_aviso(fn, payload):
+    _avisos.append((fn, payload))
+    _avisos_hay.set()
+
+
+def bucle_avisos():
+    while True:
+        _avisos_hay.wait(5)
+        _avisos_hay.clear()
+        while _avisos:
+            fn, payload = _avisos[0]
+            if _rpc(fn, payload, 10) is None:
+                time.sleep(5)  # sin conexión: se reintenta, en el mismo orden
+                break
+            _avisos.popleft()
+
+
+def pausa_iniciar(tipo, motivo): encolar_aviso("pausa_iniciar", {"p_device_token": CFG["device_token"], "p_tipo": tipo, "p_motivo": motivo or ""})
+def pausa_terminar(): encolar_aviso("pausa_terminar", {"p_device_token": CFG["device_token"]})
 
 
 def leer_settings():
-    return _rpc_dict("get_monitor_settings", {"p_device_token": CFG["device_token"]})
+    return _rpc_dict("get_monitor_settings", {"p_device_token": CFG["device_token"]}, LATIDO_TIMEOUT)
 
 
 def leer_limites():
@@ -667,7 +758,7 @@ def leer_limites():
     - idle_threshold_minutes: a los cuántos minutos sin mover mouse/teclado se marca "inactivo".
     - auto_end_idle_minutes: a los cuántos minutos de inactividad se cierra el turno solo.
     Si falla (sin conexión, versión vieja de la base, etc.), devuelve None y se usan los valores por defecto."""
-    return _rpc_dict("get_monitor_limits", {"p_device_token": CFG["device_token"]})
+    return _rpc_dict("get_monitor_limits", {"p_device_token": CFG["device_token"]}, LATIDO_TIMEOUT)
 
 
 def reclamar_equipo():
@@ -677,7 +768,7 @@ def reclamar_equipo():
     persona ya está reportando desde OTRA PC. Devuelve None si no se pudo pedir
     (sin conexión, o base sin la función todavía): en ese caso el que llama asume
     que SÍ le toca, para no romper lo que ya funcionaba."""
-    return _rpc_dict("reclamar_equipo", {"p_device_token": CFG["device_token"], "p_machine_id": CFG.get("machine_id", "")})
+    return _rpc_dict("reclamar_equipo", {"p_device_token": CFG["device_token"], "p_machine_id": CFG.get("machine_id", "")}, LATIDO_TIMEOUT)
 
 
 def notificar_otra_pc():
@@ -746,25 +837,48 @@ def aplicar_comando(cmd, motivo=""):
         try: pausa_iniciar("fin_turno", "")
         except Exception: pass
         set_estado(Estado.APAGADO)
+    elif cmd == "actualizar":
+        # v1.9.4: el CRM pide actualizarse ya (sin esperar la revisión de 30 min).
+        # En su hilo y con un respiro, para que la orden quede confirmada antes.
+        def _act():
+            time.sleep(3)
+            actualizar_ya()
+        threading.Thread(target=_act, daemon=True).start()
     else:
         return
     log("comando del CRM aplicado: %s %s" % (cmd, motivo))
 
 
-def bucle_monitoreo():
-    global _auto_terminado, _ultimo_comando_id, _tengo_equipo
-    pendientes = []; ultimo_flush = time.time(); ultima_captura = 0; ultimo_comando = 0
-    shot_enabled = True; shot_interval = CFG["screenshot_interval_minutes"] * 60
-    # Estos dos los puede cambiar el dueño desde el CRM; arrancan con los valores por defecto
-    # y se refrescan cada rato con leer_limites().
-    idle_thr = max(30, int(CFG.get("idle_threshold_seconds", 300)))
-    auto_end = max(5, int(CFG.get("auto_end_idle_minutes", 60))) * 60
+# Lo que el latido lee del CRM y el muestreo usa (v1.9.4: hilos separados).
+_ajustes = {"idle_thr": 300, "auto_end": 3600, "shot_enabled": True, "shot_interval": 300}
+_ajustes_lock = threading.Lock()
+
+# Lo que espera subir. Las muestras llevan un número para borrar solo las que
+# llegaron; las capturas, a lo más 10 (con mala señal no llenan la memoria).
+_muestras = collections.deque(maxlen=5760)   # ~24 h a una cada 15 s
+_capturas = collections.deque(maxlen=10)
+_subidas_lock = threading.Lock()
+_seq_muestra = 0
+
+
+def _ajuste(clave):
+    with _ajustes_lock:
+        return _ajustes[clave]
+
+
+def bucle_latido():
+    """Cada 25 s: estado al CRM, candado de PC, límites y órdenes.
+
+    v1.9.4: va solo, con esperas cortas, y el estado sale PRIMERO. Hasta 1.9.3
+    iba al final de una vuelta que también subía muestras y capturas: con mala
+    señal el CRM pasaba minutos sin noticias y bloqueaba a quien trabajaba."""
+    global _ultimo_comando_id, _tengo_equipo
     ultimo_limites = 0
-    host = socket.gethostname()
     while True:
-        # --- Chequeo periódico (~25s): candado de 1 PC, límites y órdenes del CRM ---
-        if time.time() - ultimo_comando >= 25:
-            ultimo_comando = time.time()
+        inicio = time.time()
+        try:
+            if _tengo_equipo:
+                reportar_estado()
             # Candado: ¿me toca contar a MÍ, o esta persona ya está en otra PC?
             rc = reclamar_equipo()
             if rc is not None:
@@ -778,15 +892,18 @@ def bucle_monitoreo():
                     ultimo_limites = time.time()
                     lm = leer_limites()
                     if lm:
-                        try: idle_thr = max(30, int(float(lm.get("idle_threshold_minutes", 5)) * 60))
-                        except Exception: pass
-                        try: auto_end = max(5 * 60, int(float(lm.get("auto_end_idle_minutes", 60)) * 60))
-                        except Exception: pass
+                        with _ajustes_lock:
+                            try: _ajustes["idle_thr"] = max(30, int(float(lm.get("idle_threshold_minutes", 5)) * 60))
+                            except Exception: pass
+                            try: _ajustes["auto_end"] = max(5 * 60, int(float(lm.get("auto_end_idle_minutes", 60)) * 60))
+                            except Exception: pass
                 # Órdenes desde el CRM (funciona en cualquier estado; casi inmediato)
                 s = leer_settings()
                 if s:
-                    shot_enabled = bool(s.get("screenshots_enabled", True))
-                    shot_interval = max(1, int(s.get("screenshot_interval_minutes", 5))) * 60
+                    with _ajustes_lock:
+                        _ajustes["shot_enabled"] = bool(s.get("screenshots_enabled", True))
+                        try: _ajustes["shot_interval"] = max(1, int(s.get("screenshot_interval_minutes", 5))) * 60
+                        except Exception: pass
                     try:
                         cid = int(s.get("comando_id") or 0)
                     except Exception:
@@ -797,48 +914,91 @@ def bucle_monitoreo():
                         _ultimo_comando_id = cid
                         try: confirmar_comando(cid)
                         except Exception: pass
-                try: reportar_estado()
-                except Exception: pass
-        # Si esta persona ya está activa en otra PC, este equipo no cuenta nada.
-        if not _tengo_equipo:
-            pendientes = []; time.sleep(2); continue
-        with _lock:
-            activo = (estado == Estado.ACTIVO)
-            apagado = (estado == Estado.APAGADO)
-        if not activo:
-            # Si el turno se cerró solo por inactividad y la persona volvió a la PC,
-            # se le vuelve a ofrecer empezar (un clic), sin contar el tiempo que estuvo fuera.
-            if apagado and _auto_terminado and segundos_inactivo() < 60:
-                _auto_terminado = False
-                mostrar_prompt_empezar()
-            pendientes = []; time.sleep(2); continue
-        idle = segundos_inactivo()
-        # Cerrar el turno solo si lleva mucho rato sin actividad (no contar la noche
-        # ni cuando dejan la PC prendida). Al volver, se ofrece empezar de nuevo.
-        if idle >= auto_end:
-            log("fin de turno por inactividad (%d min)" % (auto_end // 60))
-            try:
+        except Exception as e:
+            log("latido fallo: %r" % (e,))
+        time.sleep(max(1.0, LATIDO_CADA - (time.time() - inicio)))
+
+
+def bucle_subidas():
+    """Sube muestras (cada ~60 s) y capturas. Si falla, se reintenta: nada se bota."""
+    ultimo_flush = 0.0
+    espera_captura = 0.0
+    while True:
+        time.sleep(2)
+        try:
+            ahora = time.time()
+            if ahora - ultimo_flush >= CFG["flush_interval_seconds"]:
+                with _subidas_lock:
+                    lote = list(_muestras)[:500]
+                if lote:
+                    ultimo_flush = ahora
+                    if enviar_muestras([m for _, m in lote]):
+                        hasta = lote[-1][0]
+                        with _subidas_lock:
+                            while _muestras and _muestras[0][0] <= hasta:
+                                _muestras.popleft()
+                        log("enviadas %d muestras" % len(lote))
+            if _capturas and time.time() >= espera_captura:
+                with _subidas_lock:
+                    ts, img = _capturas[0]
+                if enviar_captura(ts, img):
+                    with _subidas_lock:
+                        if _capturas and _capturas[0][0] == ts:
+                            _capturas.popleft()
+                    log("captura enviada")
+                else:
+                    espera_captura = time.time() + 30  # se reintenta en 30 s
+        except Exception as e:
+            log("subidas fallo: %r" % (e,))
+
+
+def bucle_monitoreo():
+    """Cada 15 s: una muestra de actividad, y la captura cuando toca. Solo
+    local: no espera a la red (eso lo hacen bucle_subidas y bucle_avisos)."""
+    global _auto_terminado, _seq_muestra
+    ultima_captura = 0
+    host = socket.gethostname()
+    while True:
+        inicio = time.time()
+        try:
+            # Si esta persona ya está activa en otra PC, este equipo no cuenta nada.
+            if not _tengo_equipo:
+                time.sleep(2); continue
+            with _lock:
+                activo = (estado == Estado.ACTIVO)
+                apagado = (estado == Estado.APAGADO)
+            if not activo:
+                # Si el turno se cerró solo por inactividad y la persona volvió a la PC,
+                # se le vuelve a ofrecer empezar (un clic), sin contar el tiempo que estuvo fuera.
+                if apagado and _auto_terminado and segundos_inactivo() < 60:
+                    _auto_terminado = False
+                    mostrar_prompt_empezar()
+                time.sleep(2); continue
+            idle = segundos_inactivo()
+            # Cerrar el turno solo si lleva mucho rato sin actividad (no contar la noche
+            # ni cuando dejan la PC prendida). Al volver, se ofrece empezar de nuevo.
+            auto_end = _ajuste("auto_end")
+            if idle >= auto_end:
+                log("fin de turno por inactividad (%d min)" % (auto_end // 60))
                 pausa_iniciar("fin_turno", "inactividad")
-            except Exception:
-                pass
-            set_estado(Estado.APAGADO)
-            _auto_terminado = True
-            pendientes = []
-            continue
-        app_name, titulo = ventana_activa()
-        pendientes.append({"captured_at": datetime.now(timezone.utc).isoformat(),
-            "active_app": app_name, "window_title": titulo, "idle_seconds": round(idle, 1),
-            "is_idle": idle >= idle_thr, "hostname": host, "os": "windows"})
-        if time.time() - ultimo_flush >= CFG["flush_interval_seconds"] and pendientes:
-            if enviar_muestras(pendientes):
-                log("enviadas %d muestras" % len(pendientes)); pendientes = []
-            ultimo_flush = time.time()
-        if shot_enabled and (time.time() - ultima_captura >= shot_interval):
-            img = capturar_pantalla_jpeg()
-            if img and enviar_captura(datetime.now(timezone.utc).isoformat(), img):
-                log("captura enviada")
-            ultima_captura = time.time()
-        time.sleep(CFG["sample_interval_seconds"])
+                set_estado(Estado.APAGADO)
+                _auto_terminado = True
+                continue
+            app_name, titulo = ventana_activa()
+            with _subidas_lock:
+                _seq_muestra += 1
+                _muestras.append((_seq_muestra, {"captured_at": datetime.now(timezone.utc).isoformat(),
+                    "active_app": app_name, "window_title": titulo, "idle_seconds": round(idle, 1),
+                    "is_idle": idle >= _ajuste("idle_thr"), "hostname": host, "os": "windows"}))
+            if _ajuste("shot_enabled") and (time.time() - ultima_captura >= _ajuste("shot_interval")):
+                img = capturar_pantalla_jpeg()
+                if img:
+                    with _subidas_lock:
+                        _capturas.append((datetime.now(timezone.utc).isoformat(), img))
+                ultima_captura = time.time()
+        except Exception as e:
+            log("muestreo fallo: %r" % (e,))
+        time.sleep(max(1.0, CFG["sample_interval_seconds"] - (time.time() - inicio)))
 
 
 # ------------------------------------------------------------- bandeja
@@ -950,7 +1110,8 @@ def set_estado(nuevo, motivo=""):
     log("estado -> %s %s" % (nuevo, motivo))
     # Recordar el estado para poder reanudar tras un reinicio.
     try:
-        guardar_config({"ultimo_estado": nuevo, "ultimo_estado_at": datetime.now(timezone.utc).isoformat()})
+        guardar_config({"ultimo_estado": nuevo, "ultimo_motivo": motivo or "-",
+                        "ultimo_estado_at": datetime.now(timezone.utc).isoformat()})
     except Exception:
         pass
     if nuevo == Estado.ACTIVO:
@@ -1028,7 +1189,9 @@ def correr_bandeja():
         # cierran la app por su cuenta cuando toca.
     )
     icono = pystray.Icon("mishop_monitor", icon=imagen_icono(), title=titulo_estado(), menu=MENU)
-    threading.Thread(target=bucle_monitoreo, daemon=True).start()
+    # v1.9.4: cuatro hilos que no se esperan entre sí (ver bucle_latido).
+    for hilo in (bucle_latido, bucle_monitoreo, bucle_subidas, bucle_avisos):
+        threading.Thread(target=hilo, daemon=True).start()
     icono.run()
 
 
@@ -1073,18 +1236,32 @@ def main():
     if mostrar_listo is None:
         global estado
         cfg = leer_config_guardada()
+        global motivo_pausa
         reanudar = False
-        if cfg.get("ultimo_estado") == Estado.ACTIVO and cfg.get("ultimo_estado_at"):
+        tras_actualizar = False
+        try:
+            if cfg.get("reabrir_tras_actualizar"):
+                dt = datetime.fromisoformat(cfg["reabrir_tras_actualizar"])
+                tras_actualizar = (datetime.now(timezone.utc) - dt).total_seconds() < 15 * 60
+                guardar_config({}, quitar=("reabrir_tras_actualizar",))
+        except Exception:
+            pass
+        # v1.9.4: también vuelve a la PAUSA (antes quedaba apagado con la pausa
+        # abierta en el CRM), y tras una actualización siempre vuelve.
+        if cfg.get("ultimo_estado") in (Estado.ACTIVO, Estado.PAUSA) and cfg.get("ultimo_estado_at"):
             try:
                 dt = datetime.fromisoformat(cfg["ultimo_estado_at"])
                 ventana = CFG.get("resume_window_minutes", 30) * 60
-                if (datetime.now(timezone.utc) - dt).total_seconds() < ventana:
+                if tras_actualizar or (datetime.now(timezone.utc) - dt).total_seconds() < ventana:
                     reanudar = True
             except Exception:
                 pass
         if reanudar:
-            estado = Estado.ACTIVO
-            log("reanudando turno activo tras reinicio")
+            estado = cfg["ultimo_estado"]
+            if estado == Estado.PAUSA:
+                m = cfg.get("ultimo_motivo") or ""
+                motivo_pausa = "" if m == "-" else m
+            log("reanudando turno (%s) tras %s" % (estado, "actualizar" if tras_actualizar else "reinicio"))
         else:
             threading.Thread(target=ventana_empezar_turno,
                              args=((cfg.get("persona") or "").strip(),), daemon=True).start()
